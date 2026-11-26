@@ -28,7 +28,10 @@ type agentState struct {
 
 func main() {
 	apiURL := env("TREEWARD_API_URL", "http://treeward-api:8080")
-	bootstrap := env("TREEWARD_BOOTSTRAP_TOKEN", "dev-bootstrap")
+	bootstrap := os.Getenv("TREEWARD_BOOTSTRAP_TOKEN")
+	if bootstrap == "" {
+		log.Fatal("TREEWARD_BOOTSTRAP_TOKEN is required")
+	}
 	cluster := env("TREEWARD_CLUSTER", "kind-treeward")
 	listen := env("TREEWARD_CONNECTOR_ADDR", ":8090")
 	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")

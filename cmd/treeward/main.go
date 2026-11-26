@@ -71,7 +71,10 @@ func runToken(api string) {
 	switch os.Args[2] {
 	case "create":
 		name := mustArg(3, "token name required")
-		bootstrap := env("TREEWARD_BOOTSTRAP_TOKEN", "dev-bootstrap")
+		bootstrap := os.Getenv("TREEWARD_BOOTSTRAP_TOKEN")
+		if bootstrap == "" {
+			fatal(fmt.Errorf("TREEWARD_BOOTSTRAP_TOKEN is required for 'token create'"))
+		}
 		var raw json.RawMessage
 		doRequest(http.MethodPost, api+"/v1/tokens", types.CreateTokenRequest{Name: name}, bootstrap, &raw)
 		var buf bytes.Buffer
@@ -226,7 +229,7 @@ Usage:
 Env:
   TREEWARD_API_URL         (default http://127.0.0.1:8080)
   TREEWARD_TOKEN           (operator bearer token for admin routes)
-  TREEWARD_BOOTSTRAP_TOKEN (bootstrap token for 'token create', default dev-bootstrap)
+  TREEWARD_BOOTSTRAP_TOKEN (bootstrap token for 'token create', required)
 
 Pause-on-hard-fail (binding → paused; no auto-revert; promote rejected):
   Attest: set agent TREEWARD_ATTEST_FAIL=<canary-node-id> (e.g. kind-worker-canary),

@@ -21,7 +21,10 @@ func main() {
 	flag.Parse()
 
 	addr := env("TREEWARD_ADDR", ":8080")
-	bootstrap := env("TREEWARD_BOOTSTRAP_TOKEN", "dev-bootstrap")
+	bootstrap := os.Getenv("TREEWARD_BOOTSTRAP_TOKEN")
+	if bootstrap == "" {
+		log.Fatal("TREEWARD_BOOTSTRAP_TOKEN is required")
+	}
 	keyDir := env("TREEWARD_KEY_DIR", "/var/treeward/keys")
 	dataDir := env("TREEWARD_DATA_DIR", "/var/treeward/data")
 
