@@ -1,12 +1,14 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/treeward-ai/treeward/internal/api"
 	"github.com/treeward-ai/treeward/internal/signer"
@@ -56,8 +58,29 @@ func main() {
 		})
 		log.Printf("shirudo attest verifier enabled (bin=%s)", *shirudoBin)
 	}
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           srv.Mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	tlsCert := os.Getenv("TREEWARD_TLS_CERT")
+	tlsKey := os.Getenv("TREEWARD_TLS_KEY")
+	if (tlsCert == "") != (tlsKey == "") {
+		log.Fatal("TREEWARD_TLS_CERT and TREEWARD_TLS_KEY must both be set to enable TLS")
+	}
+	if tlsCert != "" {
+		httpSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+		log.Printf("treeward api listening on %s (TLS 1.3)", addr)
+		log.Fatal(httpSrv.ListenAndServeTLS(tlsCert, tlsKey))
+	}
+
 	log.Printf("treeward api listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, srv.Mux))
+	log.Fatal(httpSrv.ListenAndServe())
 }
 
 func env(k, def string) string {

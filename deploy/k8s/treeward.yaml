@@ -71,11 +71,64 @@ spec:
       labels:
         app: treeward-api
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: init-data-perms
+          image: treeward:quickstart
+          imagePullPolicy: Never
+          command:
+            - /bin/sh
+            - -c
+            - mkdir -p /mnt/data /mnt/keys && chown -R 10001:10001 /mnt/data /mnt/keys && chmod 0700 /mnt/data /mnt/keys
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - FOWNER
+                - DAC_OVERRIDE
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: data
+              mountPath: /mnt
       containers:
         - name: api
           image: treeward:quickstart
           imagePullPolicy: Never
           command: ["/app/api"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           env:
             - name: TREEWARD_ADDR
               value: ":8080"
@@ -93,9 +146,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/treeward/data
+              subPath: data
             - name: data
               mountPath: /var/treeward/keys
               subPath: keys
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /healthz
@@ -106,6 +162,8 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: treeward-api-data
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -135,11 +193,32 @@ spec:
       labels:
         app: treeward-connector
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: connector
           image: treeward:quickstart
           imagePullPolicy: Never
           command: ["/app/connector"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
           env:
             - name: TREEWARD_API_URL
               value: http://treeward-api:8080
@@ -180,11 +259,32 @@ spec:
       labels:
         app: treeward-agent
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: agent
           image: treeward:quickstart
           imagePullPolicy: Never
           command: ["/app/agent"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
           env:
             - name: TREEWARD_RUNTIME
               value: "stub"
