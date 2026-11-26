@@ -441,3 +441,49 @@ func TestNewRuntimeSelection(t *testing.T) {
 		t.Fatalf("New(invalid) expected error, got nil")
 	}
 }
+
+func TestShirudoInventoryRolloutLabel(t *testing.T) {
+	bin, _ := writeFakeShirudo(t, `
+if [ "$1" = "status" ] && [ "$2" = "--json" ]; then
+  echo '{"status":"ok","upatches_loaded":[],"hostname":"lab-vm-1"}'
+  exit 0
+fi
+exit 1
+`)
+
+	t.Run("omitted when TREEWARD_ROLLOUT unset", func(t *testing.T) {
+		t.Setenv("TREEWARD_ROLLOUT", "")
+		rt := NewShirudo(WithShirudoBin(bin), WithNodeID("lab-vm-1"))
+		nodes, err := rt.Inventory()
+		if err != nil {
+			t.Fatalf("Inventory() error: %v", err)
+		}
+		if _, ok := nodes[0].Labels[types.LabelRollout]; ok {
+			t.Fatalf("expected %s label to be omitted, got %+v", types.LabelRollout, nodes[0].Labels)
+		}
+	})
+
+	t.Run("set from TREEWARD_ROLLOUT env", func(t *testing.T) {
+		t.Setenv("TREEWARD_ROLLOUT", "canary")
+		rt := NewShirudo(WithShirudoBin(bin), WithNodeID("lab-vm-1"))
+		nodes, err := rt.Inventory()
+		if err != nil {
+			t.Fatalf("Inventory() error: %v", err)
+		}
+		if got := nodes[0].Labels[types.LabelRollout]; got != types.RolloutCanary {
+			t.Fatalf("label %s = %q, want %q", types.LabelRollout, got, types.RolloutCanary)
+		}
+	})
+
+	t.Run("overridden via WithRollout option", func(t *testing.T) {
+		t.Setenv("TREEWARD_ROLLOUT", "")
+		rt := NewShirudo(WithShirudoBin(bin), WithNodeID("lab-vm-1"), WithRollout("canary"))
+		nodes, err := rt.Inventory()
+		if err != nil {
+			t.Fatalf("Inventory() error: %v", err)
+		}
+		if got := nodes[0].Labels[types.LabelRollout]; got != types.RolloutCanary {
+			t.Fatalf("label %s = %q, want %q", types.LabelRollout, got, types.RolloutCanary)
+		}
+	})
+}
