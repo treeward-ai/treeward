@@ -1,0 +1,18 @@
+# build output
+bin/
+*.test
+*.out
+
+# local state / secrets
+*.db
+*.db-shm
+*.db-wal
+*.priv
+*.pem
+.env
+kubeconfig*
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store

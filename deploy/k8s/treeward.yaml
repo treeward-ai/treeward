@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: treeward
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: treeward-bootstrap
+  namespace: treeward
+type: Opaque
+stringData:
+  token: dev-bootstrap
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: treeward-api-data
+  namespace: treeward
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: treeward-api
+  namespace: treeward
+spec:
+  selector:
+    app: treeward-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: treeward-api
+  namespace: treeward
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: treeward-api
+  template:
+    metadata:
+      labels:
+        app: treeward-api
+    spec:
+      containers:
+        - name: api
+          image: treeward:mvp
+          imagePullPolicy: Never
+          command: ["/app/api"]
+          env:
+            - name: TREEWARD_ADDR
+              value: ":8080"
+            - name: TREEWARD_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: treeward-bootstrap
+                  key: token
+            - name: TREEWARD_KEY_DIR
+              value: /var/treeward/keys
+            - name: TREEWARD_DATA_DIR
+              value: /var/treeward/data
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: data
+              mountPath: /var/treeward/data
+            - name: data
+              mountPath: /var/treeward/keys
+              subPath: keys
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: treeward-api-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: treeward-connector
+  namespace: treeward
+spec:
+  selector:
+    app: treeward-connector
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: treeward-connector
+  namespace: treeward
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: treeward-connector
+  template:
+    metadata:
+      labels:
+        app: treeward-connector
+    spec:
+      containers:
+        - name: connector
+          image: treeward:mvp
+          imagePullPolicy: Never
+          command: ["/app/connector"]
+          env:
+            - name: TREEWARD_API_URL
+              value: http://treeward-api:8080
+            - name: TREEWARD_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: treeward-bootstrap
+                  key: token
+            - name: TREEWARD_CLUSTER
+              value: kind-treeward
+            - name: TREEWARD_CONNECTOR_ADDR
+              value: ":8090"
+          ports:
+            - containerPort: 8090
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 1
+            periodSeconds: 3
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: treeward-agent
+  namespace: treeward
+spec:
+  selector:
+    matchLabels:
+      app: treeward-agent
+  template:
+    metadata:
+      labels:
+        app: treeward-agent
+    spec:
+      containers:
+        - name: agent
+          image: treeward:mvp
+          imagePullPolicy: Never
+          command: ["/app/agent"]
+          env:
+            - name: TREEWARD_CONNECTOR_URL
+              value: http://treeward-connector:8090
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
