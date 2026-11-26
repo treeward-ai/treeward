@@ -244,7 +244,34 @@ echo '{"verdict":"ok","checks":[{"name":"quote","status":"ok"}]}'
 		argsFile := filepath.Join(t.TempDir(), "args.txt")
 		bin := writeFakeShirudo(t, `#!/bin/sh
 printf '%s\n' "$@" > "`+argsFile+`"
-echo '{"verdict":"ok","checks":[]}'
+echo '{"schema":1,"verdict":"ok","checks":[{"result":"ok","text":"attestation key: the pinned key"}]}'
+`)
+		v := NewShirudoVerifier(ShirudoVerifierConfig{
+			Bin:             bin,
+			AllowUnpinnedAK: true,
+		})
+		verdict, err := v.Verify(context.Background(), ShirudoVerifyRequest{
+			NodeID:   "node-1",
+			Evidence: []byte(`{"ak_name":"abcdef0123456789"}`),
+			Nonce:    validNonce,
+		})
+		if err != nil {
+			t.Fatalf("Verify() with AllowUnpinnedAK=true error: %v", err)
+		}
+		if len(verdict.Checks) != 1 || verdict.Checks[0].Result != "ok" || verdict.Checks[0].Text != "attestation key: the pinned key" {
+			t.Fatalf("expected schema v1 result/text check fields to unmarshal, got %+v", verdict.Checks)
+		}
+		rawArgs, _ := os.ReadFile(argsFile)
+		if !strings.Contains(string(rawArgs), "abcdef0123456789") {
+			t.Fatalf("expected evidence ak_name in args, got:\n%s", string(rawArgs))
+		}
+	})
+
+	t.Run("AllowUnpinnedAK dev opt-in extracts nested ak.name from shirudo schema v1", func(t *testing.T) {
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		bin := writeFakeShirudo(t, `#!/bin/sh
+printf '%s\n' "$@" > "`+argsFile+`"
+echo '{"schema":1,"verdict":"ok","checks":[{"result":"ok","text":"nonce matches the request"}]}'
 `)
 		v := NewShirudoVerifier(ShirudoVerifierConfig{
 			Bin:             bin,
@@ -252,14 +279,14 @@ echo '{"verdict":"ok","checks":[]}'
 		})
 		if _, err := v.Verify(context.Background(), ShirudoVerifyRequest{
 			NodeID:   "node-1",
-			Evidence: []byte(`{"ak_name":"abcdef0123456789"}`),
+			Evidence: []byte(`{"schema":1,"kind":"shirudo-attestation","ak":{"public":"0023","name":"000b7631cf876923"}}`),
 			Nonce:    validNonce,
 		}); err != nil {
-			t.Fatalf("Verify() with AllowUnpinnedAK=true error: %v", err)
+			t.Fatalf("Verify() with nested ak.name error: %v", err)
 		}
 		rawArgs, _ := os.ReadFile(argsFile)
-		if !strings.Contains(string(rawArgs), "abcdef0123456789") {
-			t.Fatalf("expected evidence ak_name in args, got:\n%s", string(rawArgs))
+		if !strings.Contains(string(rawArgs), "000b7631cf876923") {
+			t.Fatalf("expected nested ak.name in args, got:\n%s", string(rawArgs))
 		}
 	})
 
