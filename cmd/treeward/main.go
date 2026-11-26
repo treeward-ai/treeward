@@ -31,8 +31,10 @@ func main() {
 	case "audit":
 		getPrint(api + "/v1/audit")
 	case "create-artifact":
-		name := arg(2, "java4shell-demo")
-		body := types.Artifact{Name: name, Type: "java", Fixes: []string{"CVE-2021-44228"}}
+		body, err := parseCreateArtifactArgs(os.Args[2:])
+		if err != nil {
+			fatal(err)
+		}
 		postPrint(api+"/v1/artifacts", body)
 	case "create-binding":
 		digest := mustArg(2, "digest required")
@@ -183,7 +185,7 @@ func usage() {
 
 Usage:
   treeward nodes|artifacts|bindings|tree|audit
-  treeward create-artifact [name]
+  treeward create-artifact [name] [--digest <value>] [--type <bpf|java|...>]
   treeward create-binding <digest>
   treeward approve|canary|promote|revert <binding-id> [actor]
   treeward attest
@@ -283,4 +285,48 @@ func env(k, def string) string {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, err)
 	os.Exit(1)
+}
+
+func parseCreateArtifactArgs(args []string) (types.Artifact, error) {
+	art := types.Artifact{
+		Name:  "java4shell-demo",
+		Type:  "java",
+		Fixes: []string{"CVE-2021-44228"},
+	}
+	nameSet := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--digest" || a == "-digest":
+			if i+1 >= len(args) {
+				return types.Artifact{}, fmt.Errorf("flag %s requires a value", a)
+			}
+			i++
+			art.Digest = args[i]
+		case strings.HasPrefix(a, "--digest="):
+			art.Digest = strings.TrimPrefix(a, "--digest=")
+		case strings.HasPrefix(a, "-digest="):
+			art.Digest = strings.TrimPrefix(a, "-digest=")
+		case a == "--type" || a == "-type":
+			if i+1 >= len(args) {
+				return types.Artifact{}, fmt.Errorf("flag %s requires a value", a)
+			}
+			i++
+			art.Type = args[i]
+		case strings.HasPrefix(a, "--type="):
+			art.Type = strings.TrimPrefix(a, "--type=")
+		case strings.HasPrefix(a, "-type="):
+			art.Type = strings.TrimPrefix(a, "-type=")
+		case strings.HasPrefix(a, "-"):
+			return types.Artifact{}, fmt.Errorf("unknown flag: %s", a)
+		default:
+			if !nameSet {
+				art.Name = a
+				nameSet = true
+			} else {
+				return types.Artifact{}, fmt.Errorf("unexpected argument: %s", a)
+			}
+		}
+	}
+	return art, nil
 }

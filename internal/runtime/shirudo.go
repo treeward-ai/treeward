@@ -123,6 +123,13 @@ func WithStateDir(dir string) ShirudoOption {
 	}
 }
 
+// WithRollout sets the treeward.ai/rollout label value (e.g. "canary") reported by Inventory.
+func WithRollout(rollout string) ShirudoOption {
+	return func(s *ShirudoRuntime) {
+		s.rollout = strings.TrimSpace(rollout)
+	}
+}
+
 // ShirudoRuntime implements Runtime by shelling out to the shirudo-runtime CLI.
 //
 // Revert / unload convention: the operator builds a signed UNLOAD directive
@@ -139,14 +146,15 @@ type ShirudoRuntime struct {
 	hostname       string
 	upatchDir      string
 	stateDir       string
+	rollout        string
 	ownedLoaded    bool
 	owned          map[string]bool
 	loggedExternal map[string]bool
 }
 
 // NewShirudo constructs a ShirudoRuntime configured from environment variables
-// (SHIRUDO_RUNTIME_BIN, NODE_NAME/HOSTNAME, SHIRUDO_UPATCH_DIR, SHIRUDO_STATE_DIR)
-// and optional overrides.
+// (SHIRUDO_RUNTIME_BIN, NODE_NAME/HOSTNAME, SHIRUDO_UPATCH_DIR, SHIRUDO_STATE_DIR,
+// TREEWARD_ROLLOUT) and optional overrides.
 func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 	host, _ := os.Hostname()
 	hostname := env("NODE_NAME", env("HOSTNAME", host))
@@ -160,6 +168,7 @@ func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 		hostname:       hostname,
 		upatchDir:      env("SHIRUDO_UPATCH_DIR", ""),
 		stateDir:       env("SHIRUDO_STATE_DIR", DefaultShirudoStateDir),
+		rollout:        strings.TrimSpace(os.Getenv("TREEWARD_ROLLOUT")),
 		owned:          map[string]bool{},
 		loggedExternal: map[string]bool{},
 	}
@@ -251,6 +260,9 @@ func (s *ShirudoRuntime) Inventory() ([]types.Node, error) {
 	}
 	if st.Status != "" {
 		labels["shirudo.io/status"] = st.Status
+	}
+	if s.rollout != "" {
+		labels[types.LabelRollout] = s.rollout
 	}
 
 	loaded := make([]string, len(st.UpatchesLoaded))
