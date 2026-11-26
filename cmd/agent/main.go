@@ -28,12 +28,15 @@ func main() {
 
 	connector := env("TREEWARD_CONNECTOR_URL", "http://treeward-connector:8090")
 	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
-	treePubKey, err := validateTreeVerifyConfig(envBool("TREEWARD_VERIFY_TREE"), os.Getenv("TREEWARD_TREE_PUBKEY"))
+	kind := *runtimeFlag
+	treePubKey, verifyWarning, err := resolveTreeVerifyConfig(kind, os.Getenv("TREEWARD_VERIFY_TREE"), os.Getenv("TREEWARD_TREE_PUBKEY"))
 	if err != nil {
 		log.Fatalf("tree verify config: %v", err)
 	}
+	if verifyWarning != "" {
+		log.Printf("%s", verifyWarning)
+	}
 
-	kind := *runtimeFlag
 	rt, err := runtime.New(kind)
 	if err != nil {
 		log.Fatalf("runtime: %v", err)
@@ -203,17 +206,38 @@ type httpError struct {
 
 func (e *httpError) Error() string { return e.body }
 
-func validateTreeVerifyConfig(verifyTree bool, pubKeyHex string) (string, error) {
+func resolveTreeVerifyConfig(runtimeKind, verifyEnv, pubKeyHex string) (string, string, error) {
+	verifyEnv = strings.TrimSpace(verifyEnv)
 	pubKeyHex = strings.TrimSpace(pubKeyHex)
+
+	var verifyTree bool
+	var explicitDisable bool
+	switch {
+	case verifyEnv == "":
+		verifyTree = strings.EqualFold(strings.TrimSpace(runtimeKind), "shirudo")
+	case verifyEnv == "1" || strings.EqualFold(verifyEnv, "true"):
+		verifyTree = true
+	case verifyEnv == "0" || strings.EqualFold(verifyEnv, "false"):
+		verifyTree = false
+		explicitDisable = true
+	default:
+		return "", "", fmt.Errorf("invalid TREEWARD_VERIFY_TREE value %q (expected 1, true, 0, or false)", verifyEnv)
+	}
+
+	if explicitDisable {
+		warn := fmt.Sprintf("WARNING: TREEWARD_VERIFY_TREE=%s disables signed tree verification for runtime=%s; agent will trust unsigned desired.Nodes", verifyEnv, runtimeKind)
+		return "", warn, nil
+	}
+
 	if verifyTree && pubKeyHex == "" {
-		return "", fmt.Errorf("TREEWARD_VERIFY_TREE is enabled but TREEWARD_TREE_PUBKEY is empty")
+		return "", "", fmt.Errorf("tree verification is enabled for runtime=%s but TREEWARD_TREE_PUBKEY is empty (obtain treePubKey from GET /v1/desired and pin it out-of-band, or set TREEWARD_VERIFY_TREE=0 to disable)", runtimeKind)
 	}
 	if pubKeyHex != "" {
 		if _, err := signer.ParsePublicKeyHex(pubKeyHex); err != nil {
-			return "", fmt.Errorf("invalid TREEWARD_TREE_PUBKEY: %w", err)
+			return "", "", fmt.Errorf("invalid TREEWARD_TREE_PUBKEY: %w", err)
 		}
 	}
-	return pubKeyHex, nil
+	return pubKeyHex, "", nil
 }
 
 // verifyAndResolveDesired verifies the full Ed25519 hash-chained TreeOp log,
@@ -262,9 +286,4 @@ func env(k, def string) string {
 		return v
 	}
 	return def
-}
-
-func envBool(k string) bool {
-	v := strings.TrimSpace(os.Getenv(k))
-	return v == "1" || strings.EqualFold(v, "true")
 }

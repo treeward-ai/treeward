@@ -106,6 +106,7 @@ scripts/{quickstart,demo,teardown}.sh
 
 Quickstart runs with `TREEWARD_RUNTIME=stub` (no kernel enforcement). Running with real eBPF upatch enforcement via [Shirudo](https://docs.shirudo.dev/) is a separate, advanced setup on Linux hosts/VMs with `shirudo-runtime` installed and `TREEWARD_RUNTIME=shirudo`:
 
+- **Signed tree verification (default ON for `shirudo`):** When running with `--runtime=shirudo` (or `TREEWARD_RUNTIME=shirudo`), signed tree-op verification is enabled by default and fails closed if `TREEWARD_TREE_PUBKEY` is unset. Obtain the control plane's Ed25519 public key from `GET /v1/desired` (`treePubKey` field) and pin it out-of-band via `TREEWARD_TREE_PUBKEY` on each agent (set `TREEWARD_VERIFY_TREE=0` only to explicitly disable verification, which logs a warning).
 - **Signed unload directives:** Operators build a signed UNLOAD directive alongside each upatch artifact using the convention `<SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. Treeward never holds the operator signing key; on revert, the agent invokes `shirudo-runtime upatch unload <SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. If the directive file is missing, the agent logs an error and skips the unload call.
 - **Ownership tracking:** The agent persists the set of upatches that have appeared in a Treeward desired state in `<SHIRUDO_STATE_DIR>/owned.json` (default `/var/lib/treeward-agent/owned.json`). Externally loaded upatches not present in `owned.json` (such as `app-sandbox`) are never unloaded by Treeward.
 

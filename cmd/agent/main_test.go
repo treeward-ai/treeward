@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,31 +92,118 @@ func (s *spyRuntime) Attest(nonce string, nodes []types.Node, loaded map[string]
 	return nil, nil
 }
 
-func TestValidateTreeVerifyConfig(t *testing.T) {
+func TestResolveTreeVerifyConfig(t *testing.T) {
 	sig, err := signer.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	validPub := sig.PublicKeyHex()
 
-	// Fail closed when TREEWARD_VERIFY_TREE is enabled without a pubkey.
-	if _, err := validateTreeVerifyConfig(true, ""); err == nil {
-		t.Fatal("expected error when verifyTree=true and pubKey is empty")
+	tests := []struct {
+		name        string
+		runtimeKind string
+		verifyEnv   string
+		pubKeyHex   string
+		wantPub     string
+		wantWarn    bool
+		wantErr     bool
+	}{
+		{
+			name:        "shirudo default-on with pubkey",
+			runtimeKind: "shirudo",
+			verifyEnv:   "",
+			pubKeyHex:   "  " + validPub + "  ",
+			wantPub:     validPub,
+		},
+		{
+			name:        "shirudo default-on without pubkey fails closed",
+			runtimeKind: "shirudo",
+			verifyEnv:   "",
+			pubKeyHex:   "",
+			wantErr:     true,
+		},
+		{
+			name:        "stub default-off without pubkey",
+			runtimeKind: "stub",
+			verifyEnv:   "",
+			pubKeyHex:   "",
+			wantPub:     "",
+		},
+		{
+			name:        "mock default-off without pubkey",
+			runtimeKind: "mock",
+			verifyEnv:   "",
+			pubKeyHex:   "",
+			wantPub:     "",
+		},
+		{
+			name:        "explicit disable 0 on shirudo warns and returns disabled",
+			runtimeKind: "shirudo",
+			verifyEnv:   "0",
+			pubKeyHex:   validPub,
+			wantPub:     "",
+			wantWarn:    true,
+		},
+		{
+			name:        "explicit disable false on stub warns and returns disabled",
+			runtimeKind: "stub",
+			verifyEnv:   "false",
+			pubKeyHex:   "",
+			wantPub:     "",
+			wantWarn:    true,
+		},
+		{
+			name:        "explicit enable 1 on stub with pubkey",
+			runtimeKind: "stub",
+			verifyEnv:   "1",
+			pubKeyHex:   validPub,
+			wantPub:     validPub,
+		},
+		{
+			name:        "explicit enable true on stub without pubkey fails closed",
+			runtimeKind: "stub",
+			verifyEnv:   "true",
+			pubKeyHex:   "",
+			wantErr:     true,
+		},
+		{
+			name:        "malformed pubkey rejected",
+			runtimeKind: "stub",
+			verifyEnv:   "",
+			pubKeyHex:   "not-valid-hex",
+			wantErr:     true,
+		},
+		{
+			name:        "invalid TREEWARD_VERIFY_TREE value rejected",
+			runtimeKind: "shirudo",
+			verifyEnv:   "maybe",
+			pubKeyHex:   validPub,
+			wantErr:     true,
+		},
 	}
-	// Disabled and empty pubkey is allowed (backwards-compatible stub mode).
-	if got, err := validateTreeVerifyConfig(false, ""); err != nil || got != "" {
-		t.Fatalf("verifyTree=false, empty pubkey = (%q, %v), want (\"\", nil)", got, err)
-	}
-	// Malformed pubkey is rejected regardless of verifyTree flag.
-	if _, err := validateTreeVerifyConfig(false, "not-valid-hex"); err == nil {
-		t.Fatal("expected error for malformed pubkey")
-	}
-	// Valid pubkey succeeds with or without verifyTree flag.
-	if got, err := validateTreeVerifyConfig(true, "  "+validPub+"  "); err != nil || got != validPub {
-		t.Fatalf("verifyTree=true valid pubkey = (%q, %v), want (%q, nil)", got, err, validPub)
-	}
-	if got, err := validateTreeVerifyConfig(false, validPub); err != nil || got != validPub {
-		t.Fatalf("verifyTree=false valid pubkey = (%q, %v), want (%q, nil)", got, err, validPub)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotPub, gotWarn, err := resolveTreeVerifyConfig(tc.runtimeKind, tc.verifyEnv, tc.pubKeyHex)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (pub=%q warn=%q)", gotPub, gotWarn)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotPub != tc.wantPub {
+				t.Fatalf("pub = %q, want %q", gotPub, tc.wantPub)
+			}
+			if tc.wantWarn && !strings.Contains(gotWarn, "WARNING") {
+				t.Fatalf("expected WARNING in %q", gotWarn)
+			}
+			if !tc.wantWarn && gotWarn != "" {
+				t.Fatalf("unexpected warning: %q", gotWarn)
+			}
+		})
 	}
 }
 
