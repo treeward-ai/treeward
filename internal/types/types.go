@@ -77,10 +77,11 @@ type Connector struct {
 }
 
 type AttestResult struct {
-	NodeID string `json:"nodeId"`
-	Nonce  string `json:"nonce"`
-	Quote  string `json:"quote"`
-	Pass   bool   `json:"pass"`
+	NodeID   string `json:"nodeId"`
+	Nonce    string `json:"nonce"`
+	Quote    string `json:"quote"`
+	Pass     bool   `json:"pass"`
+	Verified bool   `json:"verified,omitempty"`
 }
 
 type AttestCampaign struct {

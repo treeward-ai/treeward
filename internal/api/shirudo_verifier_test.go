@@ -52,10 +52,11 @@ echo '{"verdict":"ok","checks":[{"name":"quote","status":"ok"},{"name":"nonce","
 	bin := writeFakeShirudo(t, script)
 
 	v := NewShirudoVerifier(ShirudoVerifierConfig{
-		Bin:              bin,
-		AKName:           "aabbccdd",
-		ExpectConfigRoot: "deadbeef",
-		ExpectConfigPCR:  "11223344",
+		Bin:                bin,
+		AKName:             "aabbccdd",
+		AllowRuntimeEvents: true,
+		ExpectConfigRoot:   "deadbeef",
+		ExpectConfigPCR:    "11223344",
 	})
 
 	evidence := []byte(`{"quote":"base64data","ak_name":"ignored_when_cfg_set"}`)
@@ -129,18 +130,23 @@ echo '{"verdict":"ok","checks":[{"name":"quote","status":"ok"},{"name":"nonce","
 }
 
 func TestShirudoVerifier_FailVerdictAndInvalidJSON(t *testing.T) {
+	const validNonce = "0123456789abcdef"
+
 	t.Run("fail verdict with non-zero exit", func(t *testing.T) {
 		bin := writeFakeShirudo(t, `#!/bin/sh
 echo '{"verdict":"fail","checks":[{"name":"nonce","status":"fail","detail":"mismatch"}]}'
 exit 1
 `)
-		v := NewShirudoVerifier(ShirudoVerifierConfig{Bin: bin, AKName: "aabb"})
-		res := v.VerifyResult(context.Background(), "deadbeef", types.AttestResult{
+		v := NewShirudoVerifier(ShirudoVerifierConfig{Bin: bin, AKName: "aabbccdd"})
+		res := v.VerifyResult(context.Background(), validNonce, types.AttestResult{
 			NodeID: "node-1",
 			Quote:  `{"quote":"bad"}`,
 		})
 		if res.Pass {
 			t.Fatalf("expected Pass=false for fail verdict, got %+v", res)
+		}
+		if !res.Verified {
+			t.Fatalf("expected Verified=true from ShirudoVerifier, got %+v", res)
 		}
 		if !strings.Contains(strings.ToUpper(res.Quote), "FAIL") {
 			t.Fatalf("expected Quote to contain FAIL for Store.SubmitAttest compatibility, got %q", res.Quote)
@@ -152,19 +158,165 @@ exit 1
 echo 'not-valid-json'
 exit 2
 `)
-		v := NewShirudoVerifier(ShirudoVerifierConfig{Bin: bin, AKName: "aabb"})
+		v := NewShirudoVerifier(ShirudoVerifierConfig{Bin: bin, AKName: "aabbccdd"})
 		if _, err := v.Verify(context.Background(), ShirudoVerifyRequest{
 			Evidence: []byte(`{}`),
-			Nonce:    "deadbeef",
+			Nonce:    validNonce,
 		}); err == nil {
 			t.Fatalf("expected error for invalid JSON output")
 		}
-		res := v.VerifyResult(context.Background(), "deadbeef", types.AttestResult{
+		res := v.VerifyResult(context.Background(), validNonce, types.AttestResult{
 			NodeID: "node-1",
 			Quote:  `{}`,
 		})
 		if res.Pass {
 			t.Fatalf("expected Pass=false for invalid JSON, got %+v", res)
+		}
+		if !res.Verified {
+			t.Fatalf("expected Verified=true from ShirudoVerifier, got %+v", res)
+		}
+	})
+}
+
+func TestShirudoVerifier_AKPinningAndValidation(t *testing.T) {
+	const validNonce = "0123456789abcdef"
+
+	t.Run("unpinned AK fails closed by default", func(t *testing.T) {
+		invokedFile := filepath.Join(t.TempDir(), "invoked")
+		bin := writeFakeShirudo(t, `#!/bin/sh
+touch "`+invokedFile+`"
+echo '{"verdict":"ok","checks":[]}'
+`)
+		v := NewShirudoVerifier(ShirudoVerifierConfig{Bin: bin})
+		_, err := v.Verify(context.Background(), ShirudoVerifyRequest{
+			NodeID:   "node-1",
+			Evidence: []byte(`{"ak_name":"aabbccdd11223344","quote":"self-asserted"}`),
+			Nonce:    validNonce,
+		})
+		if err == nil || !strings.Contains(err.Error(), "no pinned AK configured") {
+			t.Fatalf("expected fail-closed no pinned AK error, got %v", err)
+		}
+		if _, statErr := os.Stat(invokedFile); !os.IsNotExist(statErr) {
+			t.Fatalf("expected shirudo binary not to be invoked when AK is unpinned")
+		}
+	})
+
+	t.Run("per-node pinned AK is used over self-asserted evidence ak_name", func(t *testing.T) {
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		bin := writeFakeShirudo(t, `#!/bin/sh
+printf '%s\n' "$@" > "`+argsFile+`"
+echo '{"verdict":"ok","checks":[{"name":"quote","status":"ok"}]}'
+`)
+		v := NewShirudoVerifier(ShirudoVerifierConfig{
+			Bin: bin,
+			AKNames: map[string]string{
+				"node-1": "1111222233334444",
+				"node-2": "5555666677778888",
+			},
+			AKName: "99990000aaaabbbb",
+		})
+
+		verdict, err := v.Verify(context.Background(), ShirudoVerifyRequest{
+			NodeID:   "node-2",
+			Evidence: []byte(`{"ak_name":"deadbeefdeadbeef"}`),
+			Nonce:    validNonce,
+		})
+		if err != nil {
+			t.Fatalf("Verify() error: %v", err)
+		}
+		if verdict.Verdict != "ok" {
+			t.Fatalf("verdict = %q, want ok", verdict.Verdict)
+		}
+		rawArgs, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("read args: %v", err)
+		}
+		argsStr := string(rawArgs)
+		if !strings.Contains(argsStr, "5555666677778888") {
+			t.Fatalf("expected pinned AK for node-2 in args, got:\n%s", argsStr)
+		}
+		if strings.Contains(argsStr, "--allow-runtime-events") {
+			t.Fatalf("expected --allow-runtime-events omitted when AllowRuntimeEvents=false, got:\n%s", argsStr)
+		}
+	})
+
+	t.Run("AllowUnpinnedAK dev opt-in uses evidence ak_name", func(t *testing.T) {
+		argsFile := filepath.Join(t.TempDir(), "args.txt")
+		bin := writeFakeShirudo(t, `#!/bin/sh
+printf '%s\n' "$@" > "`+argsFile+`"
+echo '{"verdict":"ok","checks":[]}'
+`)
+		v := NewShirudoVerifier(ShirudoVerifierConfig{
+			Bin:             bin,
+			AllowUnpinnedAK: true,
+		})
+		if _, err := v.Verify(context.Background(), ShirudoVerifyRequest{
+			NodeID:   "node-1",
+			Evidence: []byte(`{"ak_name":"abcdef0123456789"}`),
+			Nonce:    validNonce,
+		}); err != nil {
+			t.Fatalf("Verify() with AllowUnpinnedAK=true error: %v", err)
+		}
+		rawArgs, _ := os.ReadFile(argsFile)
+		if !strings.Contains(string(rawArgs), "abcdef0123456789") {
+			t.Fatalf("expected evidence ak_name in args, got:\n%s", string(rawArgs))
+		}
+	})
+
+	t.Run("rejects malformed or flag-injection nonce and AK name", func(t *testing.T) {
+		invokedFile := filepath.Join(t.TempDir(), "invoked")
+		bin := writeFakeShirudo(t, `#!/bin/sh
+touch "`+invokedFile+`"
+echo '{"verdict":"ok","checks":[]}'
+`)
+		v := NewShirudoVerifier(ShirudoVerifierConfig{Bin: bin, AKName: "aabbccdd"})
+
+		for _, badNonce := range []string{"--help", "-n", "deadbeef", "not-hex-at-all!!"} {
+			if _, err := v.Verify(context.Background(), ShirudoVerifyRequest{
+				NodeID:   "node-1",
+				Evidence: []byte(`{}`),
+				Nonce:    badNonce,
+			}); err == nil {
+				t.Fatalf("Verify(nonce=%q) expected error, got nil", badNonce)
+			}
+		}
+
+		for _, badAK := range []string{"--help", "-k", "aabb", "not-hex!"} {
+			if _, err := v.Verify(context.Background(), ShirudoVerifyRequest{
+				NodeID:   "node-1",
+				Evidence: []byte(`{}`),
+				Nonce:    validNonce,
+				AKName:   badAK,
+			}); err == nil {
+				t.Fatalf("Verify(akName=%q) expected error, got nil", badAK)
+			}
+		}
+
+		if _, statErr := os.Stat(invokedFile); !os.IsNotExist(statErr) {
+			t.Fatalf("expected shirudo binary not to be invoked on invalid nonce/AK")
+		}
+	})
+
+	t.Run("env config parses SHIRUDO_AK_MAP_FILE, SHIRUDO_AK_NAMES, and SHIRUDO_ALLOW_RUNTIME_EVENTS", func(t *testing.T) {
+		mapPath := filepath.Join(t.TempDir(), "aks.json")
+		if err := os.WriteFile(mapPath, []byte(`{"node-1":"11111111","node-2":"22222222"}`), 0o600); err != nil {
+			t.Fatalf("write ak map file: %v", err)
+		}
+		t.Setenv("SHIRUDO_BIN", "/usr/bin/shirudo")
+		t.Setenv("SHIRUDO_AK_MAP_FILE", mapPath)
+		t.Setenv("SHIRUDO_AK_NAMES", "node-2=33333333,node-3=44444444")
+		t.Setenv("SHIRUDO_ALLOW_RUNTIME_EVENTS", "0")
+		t.Setenv("SHIRUDO_ALLOW_UNPINNED_AK", "")
+
+		cfg := ShirudoVerifierConfigFromEnv()
+		if cfg.AllowRuntimeEvents {
+			t.Fatalf("expected AllowRuntimeEvents=false when SHIRUDO_ALLOW_RUNTIME_EVENTS=0")
+		}
+		if cfg.AllowUnpinnedAK {
+			t.Fatalf("expected AllowUnpinnedAK=false by default")
+		}
+		if cfg.AKNames["node-1"] != "11111111" || cfg.AKNames["node-2"] != "33333333" || cfg.AKNames["node-3"] != "44444444" {
+			t.Fatalf("unexpected AKNames: %+v", cfg.AKNames)
 		}
 	})
 }
@@ -221,10 +373,11 @@ func TestServer_AttestResults_ShirudoAndMockFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("SHIRUDO_BIN set uses Shirudo verifier", func(t *testing.T) {
+	t.Run("SHIRUDO_BIN set uses Shirudo verifier with pinned AK", func(t *testing.T) {
 		bin := writeFakeShirudo(t, `#!/bin/sh
 echo '{"verdict":"ok","checks":[{"name":"quote","status":"ok"}]}'
 `)
+		t.Setenv("SHIRUDO_AK_NAMES", "node-1=aabbccdd")
 		srv, tok, campID := newTestServer(t, bin)
 		if srv.Verifier == nil {
 			t.Fatalf("expected Verifier to be configured when SHIRUDO_BIN is set")
@@ -232,7 +385,7 @@ echo '{"verdict":"ok","checks":[{"name":"quote","status":"ok"}]}'
 		// Quote does not contain the nonce literally; only passes because Shirudo returned ok.
 		body, _ := json.Marshal([]types.AttestResult{{
 			NodeID: "node-1",
-			Quote:  `{"ak_name":"aabb","quote":"opaque-tpm-evidence"}`,
+			Quote:  `{"quote":"opaque-tpm-evidence"}`,
 		}})
 		req := httptest.NewRequest(http.MethodPost, "/v1/attest/campaigns/"+campID+"/results", bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+tok)
@@ -246,8 +399,74 @@ echo '{"verdict":"ok","checks":[{"name":"quote","status":"ok"}]}'
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatalf("decode response: %v", err)
 		}
-		if len(out.Results) != 1 || !out.Results[0].Pass {
-			t.Fatalf("expected shirudo pass, got %+v", out.Results)
+		if len(out.Results) != 1 || !out.Results[0].Pass || !out.Results[0].Verified {
+			t.Fatalf("expected shirudo verified pass, got %+v", out.Results)
+		}
+	})
+
+	t.Run("connector cannot spoof Verified=true or Pass=true", func(t *testing.T) {
+		// Stub mode (no Verifier): spoofed Verified=true/Pass=true with bad quote must fail.
+		srv, tok, campID := newTestServer(t, "")
+		spoofBody, _ := json.Marshal([]types.AttestResult{{
+			NodeID:   "node-1",
+			Quote:    "wrong-nonce-quote",
+			Pass:     true,
+			Verified: true,
+		}})
+		req := httptest.NewRequest(http.MethodPost, "/v1/attest/campaigns/"+campID+"/results", bytes.NewReader(spoofBody))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		srv.Mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		var out types.AttestCampaign
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(out.Results) != 1 || out.Results[0].Pass || out.Results[0].Verified {
+			t.Fatalf("spoofed Verified/Pass must be cleared and fail stub verify, got %+v", out.Results)
+		}
+	})
+
+	t.Run("rejects overwrites to already-completed campaigns", func(t *testing.T) {
+		srv, tok, campID := newTestServer(t, "")
+		camp, _ := srv.Store.GetCampaign(campID)
+
+		// First submission completes the campaign (node-1 is the only known node).
+		body1, _ := json.Marshal([]types.AttestResult{{
+			NodeID: "node-1",
+			Quote:  "mock-quote-" + camp.Nonce + "-FAIL",
+		}})
+		req1 := httptest.NewRequest(http.MethodPost, "/v1/attest/campaigns/"+campID+"/results", bytes.NewReader(body1))
+		req1.Header.Set("Authorization", "Bearer "+tok)
+		rec1 := httptest.NewRecorder()
+		srv.Mux.ServeHTTP(rec1, req1)
+		if rec1.Code != http.StatusOK {
+			t.Fatalf("first submit status = %d, body = %s", rec1.Code, rec1.Body.String())
+		}
+
+		// Second submission attempting to overwrite the failed result with a passing one must be rejected.
+		body2, _ := json.Marshal([]types.AttestResult{{
+			NodeID: "node-1",
+			Quote:  "mock-quote-" + camp.Nonce,
+		}})
+		req2 := httptest.NewRequest(http.MethodPost, "/v1/attest/campaigns/"+campID+"/results", bytes.NewReader(body2))
+		req2.Header.Set("Authorization", "Bearer "+tok)
+		rec2 := httptest.NewRecorder()
+		srv.Mux.ServeHTTP(rec2, req2)
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("second submit status = %d, want 400 (body=%s)", rec2.Code, rec2.Body.String())
+		}
+		if !strings.Contains(rec2.Body.String(), "campaign already complete") {
+			t.Fatalf("expected 'campaign already complete' error, got %q", rec2.Body.String())
+		}
+
+		// Verify original failed result was preserved.
+		after, _ := srv.Store.GetCampaign(campID)
+		if len(after.Results) != 1 || after.Results[0].Pass {
+			t.Fatalf("expected original failed result to remain immutable, got %+v", after.Results)
 		}
 	})
 }

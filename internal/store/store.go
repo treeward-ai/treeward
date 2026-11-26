@@ -581,14 +581,22 @@ func (s *Store) submitAttest(campaignID, clusterID string, results []types.Attes
 	if !ok {
 		return nil, fmt.Errorf("campaign not found")
 	}
+	if c.Status == "complete" {
+		return nil, fmt.Errorf("campaign already complete")
+	}
 	byNode := map[string]types.AttestResult{}
 	for _, existing := range c.Results {
 		byNode[existing.NodeID] = existing
 	}
 	passCount, failCount := 0, 0
 	for _, r := range results {
-		// Stub verify: quote must contain nonce; "FAIL" substring forces fail.
-		pass := strings.Contains(r.Quote, c.Nonce) && !strings.Contains(strings.ToUpper(r.Quote), "FAIL")
+		var pass bool
+		if r.Verified {
+			pass = r.Pass
+		} else {
+			// Stub verify: quote must contain nonce; "FAIL" substring forces fail.
+			pass = strings.Contains(r.Quote, c.Nonce) && !strings.Contains(strings.ToUpper(r.Quote), "FAIL")
+		}
 		r.Pass = pass
 		r.Nonce = c.Nonce
 		byNode[r.NodeID] = r

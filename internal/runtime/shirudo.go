@@ -8,11 +8,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	goruntime "runtime"
 	"sort"
 	"strings"
 
 	"github.com/treeward-ai/treeward/internal/types"
+)
+
+var (
+	upatchNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	hexNonceRe   = regexp.MustCompile(`^[0-9a-fA-F]{16,128}$`)
 )
 
 // DefaultShirudoBin is the default path to the shirudo-runtime CLI.
@@ -193,8 +199,70 @@ func (s *ShirudoRuntime) Status() (ShirudoStatus, error) {
 	return st, nil
 }
 
+func validateUpatchName(name string) error {
+	if name == "" {
+		return fmt.Errorf("invalid upatch name: empty")
+	}
+	if strings.HasPrefix(name, "-") || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) || !upatchNameRe.MatchString(name) {
+		return fmt.Errorf("invalid upatch name %q", name)
+	}
+	return nil
+}
+
+func validateUpatchPath(path string) error {
+	if path == "" {
+		return fmt.Errorf("invalid upatch path: empty")
+	}
+	if strings.HasPrefix(path, "-") {
+		return fmt.Errorf("invalid upatch path %q: leading dash not allowed", path)
+	}
+	if strings.ContainsRune(path, 0) {
+		return fmt.Errorf("invalid upatch path %q: null byte not allowed", path)
+	}
+	for _, seg := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return fmt.Errorf("invalid upatch path %q: parent traversal not allowed", path)
+		}
+	}
+	return nil
+}
+
+func resolvePathWithinBase(baseDir, filename string) (string, error) {
+	cleanBase := filepath.Clean(baseDir)
+	joined := filepath.Join(cleanBase, filename)
+	rel, err := filepath.Rel(cleanBase, joined)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("resolved path %q escapes upatch dir %q", joined, cleanBase)
+	}
+	return joined, nil
+}
+
+func (s *ShirudoRuntime) resolveUpatchPath(name string) (string, error) {
+	if err := validateUpatchName(name); err != nil {
+		return "", err
+	}
+	if s.upatchDir == "" {
+		return name, nil
+	}
+	return resolvePathWithinBase(s.upatchDir, name)
+}
+
+func (s *ShirudoRuntime) resolveUnloadDirectivePath(name string) (string, error) {
+	if err := validateUpatchName(name); err != nil {
+		return "", err
+	}
+	filename := name + unloadDirectiveSuffix
+	if s.upatchDir == "" {
+		return filename, nil
+	}
+	return resolvePathWithinBase(s.upatchDir, filename)
+}
+
 // LoadUpatch invokes `shirudo-runtime upatch load <path>`.
 func (s *ShirudoRuntime) LoadUpatch(path string) error {
+	if err := validateUpatchPath(path); err != nil {
+		return fmt.Errorf("shirudo upatch load %q: %w", path, err)
+	}
 	if _, err := s.run("upatch", "load", path); err != nil {
 		return fmt.Errorf("shirudo upatch load %q: %w", path, err)
 	}
@@ -211,7 +279,10 @@ func (s *ShirudoRuntime) UnloadDirectivePath(name string) string {
 // unload directive at <upatchDir>/<name>.unload.upatch. If the directive file
 // is absent, it logs a clear error and does not invoke shirudo-runtime.
 func (s *ShirudoRuntime) UnloadUpatch(name string) error {
-	directivePath := s.UnloadDirectivePath(name)
+	directivePath, err := s.resolveUnloadDirectivePath(name)
+	if err != nil {
+		return fmt.Errorf("shirudo upatch unload %q: %w", name, err)
+	}
 	if _, err := os.Stat(directivePath); err != nil {
 		log.Printf("shirudo: cannot unload %q: unload directive %q unavailable: %v", name, directivePath, err)
 		return fmt.Errorf("shirudo upatch unload %q: missing unload directive %q: %w", name, directivePath, err)
@@ -224,6 +295,9 @@ func (s *ShirudoRuntime) UnloadUpatch(name string) error {
 
 // AttestRaw invokes `shirudo-runtime attest --nonce <hex>` and returns the raw JSON document.
 func (s *ShirudoRuntime) AttestRaw(nonce string) (string, error) {
+	if !hexNonceRe.MatchString(nonce) {
+		return "", fmt.Errorf("shirudo attest: invalid hex nonce %q", nonce)
+	}
 	out, err := s.run("attest", "--nonce", nonce)
 	if err != nil {
 		return "", fmt.Errorf("shirudo attest: %w", err)
@@ -297,6 +371,9 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 	want := desired.Nodes[s.nodeID]
 	wantSet := make(map[string]struct{}, len(want))
 	for _, d := range want {
+		if validateUpatchName(d) != nil {
+			continue
+		}
 		wantSet[d] = struct{}{}
 		if !s.owned[d] {
 			s.owned[d] = true
@@ -311,9 +388,10 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 		if _, ok := currentSet[d]; ok {
 			continue
 		}
-		path := d
-		if s.upatchDir != "" && !filepath.IsAbs(d) {
-			path = filepath.Join(s.upatchDir, d)
+		path, err := s.resolveUpatchPath(d)
+		if err != nil {
+			nodeErrs = append(nodeErrs, fmt.Sprintf("shirudo upatch load %q: %v", d, err))
+			continue
 		}
 		if err := s.LoadUpatch(path); err != nil {
 			nodeErrs = append(nodeErrs, err.Error())
@@ -404,7 +482,7 @@ func (s *ShirudoRuntime) saveOwned() {
 	if s.stateDir == "" {
 		return
 	}
-	if err := os.MkdirAll(s.stateDir, 0o755); err != nil {
+	if err := os.MkdirAll(s.stateDir, 0o700); err != nil {
 		log.Printf("shirudo: create state dir %q: %v", s.stateDir, err)
 		return
 	}
@@ -422,7 +500,7 @@ func (s *ShirudoRuntime) saveOwned() {
 	}
 	path := s.ownedStatePath()
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		log.Printf("shirudo: write owned state %q: %v", tmp, err)
 		return
 	}

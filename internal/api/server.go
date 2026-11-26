@@ -367,8 +367,11 @@ func (s *Server) handleAttestResults(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Never trust client-supplied verdict fields.
 	nodeIDs := make([]string, len(results))
 	for i := range results {
+		results[i].Verified = false
+		results[i].Pass = false
 		nodeIDs[i] = results[i].NodeID
 	}
 	if err := s.Store.ValidateNodesInCluster(nodeIDs, conn.ClusterID); err != nil {
@@ -377,10 +380,17 @@ func (s *Server) handleAttestResults(w http.ResponseWriter, r *http.Request) {
 	}
 	campaignID := r.PathValue("id")
 	if s.Verifier != nil {
-		if c, ok := s.Store.GetCampaign(campaignID); ok {
-			for i := range results {
-				results[i] = s.Verifier.VerifyResult(r.Context(), c.Nonce, results[i])
-			}
+		c, ok := s.Store.GetCampaign(campaignID)
+		if !ok {
+			http.Error(w, "campaign not found", http.StatusBadRequest)
+			return
+		}
+		if c.Status == "complete" {
+			http.Error(w, "campaign already complete", http.StatusBadRequest)
+			return
+		}
+		for i := range results {
+			results[i] = s.Verifier.VerifyResult(r.Context(), c.Nonce, results[i])
 		}
 	}
 	c, err := s.Store.SubmitAttestForCluster(campaignID, conn.ClusterID, results)
