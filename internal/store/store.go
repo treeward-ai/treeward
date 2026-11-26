@@ -314,20 +314,35 @@ func (s *Store) Revert(bindingID, actor string) (*types.Binding, error) {
 }
 
 func (s *Store) appendTreeLocked(b *types.Binding, op string, sel map[string]string) error {
-	payload := signer.SignTreePayload(b.ArtifactDigest, op, sel)
+	if s.Signer == nil {
+		return fmt.Errorf("tree signer not configured")
+	}
+	var prevHash string
+	if len(s.Tree) > 0 {
+		var err error
+		prevHash, err = signer.TreeOpHash(s.Tree[len(s.Tree)-1])
+		if err != nil {
+			return fmt.Errorf("hash previous tree op: %w", err)
+		}
+	}
+	opRec := types.TreeOp{
+		Seq:       int64(len(s.Tree) + 1),
+		PrevHash:  prevHash,
+		Op:        op,
+		Digest:    b.ArtifactDigest,
+		Selector:  copyLabels(sel),
+		BindingID: b.ID,
+		At:        time.Now().UTC(),
+	}
+	payload, err := signer.CanonicalTreePayload(opRec)
+	if err != nil {
+		return err
+	}
 	sig, err := s.Signer.Sign(payload)
 	if err != nil {
 		return err
 	}
-	opRec := types.TreeOp{
-		Seq:       int64(len(s.Tree) + 1),
-		Op:        op,
-		Digest:    b.ArtifactDigest,
-		Selector:  sel,
-		Signature: sig,
-		BindingID: b.ID,
-		At:        time.Now().UTC(),
-	}
+	opRec.Signature = sig
 	s.Tree = append(s.Tree, opRec)
 	return nil
 }
@@ -345,37 +360,9 @@ func (s *Store) Desired() types.DesiredState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Replay tree ops into effective set per node.
-	type set map[string]struct{}
-	loaded := map[string]set{}
-	for id := range s.Nodes {
-		loaded[id] = set{}
-	}
-
-	for _, op := range s.Tree {
-		for _, n := range s.Nodes {
-			if !matchSelector(n.Labels, op.Selector) {
-				continue
-			}
-			switch op.Op {
-			case "add":
-				loaded[n.ID][op.Digest] = struct{}{}
-			case "delete":
-				if len(op.Selector) == 0 || matchSelector(n.Labels, op.Selector) {
-					delete(loaded[n.ID], op.Digest)
-				}
-			}
-		}
-	}
-
-	nodes := map[string][]string{}
-	for id, st := range loaded {
-		digests := make([]string, 0, len(st))
-		for d := range st {
-			digests = append(digests, d)
-		}
-		sort.Strings(digests)
-		nodes[id] = digests
+	nodes := make(map[string][]string, len(s.Nodes))
+	for id, n := range s.Nodes {
+		nodes[id] = signer.ReplayDesiredForNode(s.Tree, n.Labels)
 	}
 
 	ops := make([]types.TreeOp, len(s.Tree))
@@ -384,7 +371,11 @@ func (s *Store) Desired() types.DesiredState {
 	if len(ops) > 0 {
 		seq = ops[len(ops)-1].Seq
 	}
-	return types.DesiredState{TreeSeq: seq, Ops: ops, Nodes: nodes}
+	pubKey := ""
+	if s.Signer != nil {
+		pubKey = s.Signer.PublicKeyHex()
+	}
+	return types.DesiredState{TreeSeq: seq, TreePubKey: pubKey, Ops: ops, Nodes: nodes}
 }
 
 func (s *Store) ListAudit() []types.AuditEvent {

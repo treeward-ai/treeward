@@ -3,7 +3,7 @@ package types
 import "time"
 
 const (
-	LabelRollout = "treeward.ai/rollout"
+	LabelRollout  = "treeward.ai/rollout"
 	RolloutCanary = "canary"
 )
 
@@ -54,6 +54,7 @@ type AuditEvent struct {
 
 type TreeOp struct {
 	Seq       int64             `json:"seq"`
+	PrevHash  string            `json:"prevHash,omitempty"`
 	Op        string            `json:"op"` // add|delete
 	Digest    string            `json:"digest"`
 	Selector  map[string]string `json:"selector"`
@@ -63,9 +64,10 @@ type TreeOp struct {
 }
 
 type DesiredState struct {
-	TreeSeq int64               `json:"treeSeq"`
-	Ops     []TreeOp            `json:"ops"`
-	Nodes   map[string][]string `json:"nodes"` // nodeID -> digests that should be loaded
+	TreeSeq    int64               `json:"treeSeq"`
+	TreePubKey string              `json:"treePubKey,omitempty"`
+	Ops        []TreeOp            `json:"ops"`
+	Nodes      map[string][]string `json:"nodes"` // nodeID -> digests that should be loaded
 }
 
 type Connector struct {

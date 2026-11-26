@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/treeward-ai/treeward/internal/signer"
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
@@ -58,5 +59,14 @@ func TestCanarySelectionAndPromote(t *testing.T) {
 	}
 	if !reflect.DeepEqual(desired.Nodes["lab-prod"], []string{"vuln-app-shield"}) {
 		t.Fatalf("promoted desired for lab-prod = %v, want [vuln-app-shield]", desired.Nodes["lab-prod"])
+	}
+	if desired.TreePubKey != s.Signer.PublicKeyHex() {
+		t.Fatalf("desired.TreePubKey = %q, want %q", desired.TreePubKey, s.Signer.PublicKeyHex())
+	}
+	if err := signer.VerifyTreeChain(s.Signer.PublicKeyHex(), desired.Ops); err != nil {
+		t.Fatalf("VerifyTreeChain failed on store ops: %v", err)
+	}
+	if desired.Ops[0].PrevHash != "" || desired.Ops[1].PrevHash == "" {
+		t.Fatalf("unexpected PrevHash chaining: op0=%q op1=%q", desired.Ops[0].PrevHash, desired.Ops[1].PrevHash)
 	}
 }
