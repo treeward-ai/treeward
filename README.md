@@ -4,66 +4,106 @@ Fleet control plane for [Shirudo](https://docs.shirudo.dev/) — ward of the upa
 
 Approve → sign → canary → promote → revert. Shirudo loads BPF on the box; Treeward wards the tree across the fleet.
 
-## Local MVP
+## Quickstart
 
-- **Cluster:** Kind `treeward` (`kubectl --context kind-treeward`)
-- **Southbound:** stub agents (fake nodes, no eBPF)
-- **Signer:** local ed25519 key (GCP KMS later for SaaS)
-- **Store:** SQLite on PVC (`/var/treeward/data/treeward.db`)
-- **Digests:** real SHA-256 over artifact metadata
-- **Components:** API, cluster connector, stub DaemonSet agent, CLI
+Run the full control-plane demo locally in a single command.
 
-### Tools (WSL Ubuntu)
+> **Note:** The quickstart uses **stub agents** (three simulated in-memory nodes with fixture attestation quotes and **no eBPF or kernel enforcement**). For real kernel upatch enforcement with Shirudo, see [Shirudo runtime (advanced)](#shirudo-runtime-advanced) below.
+
+### Prerequisites
+
+- [Go](https://go.dev/dl/) 1.26+
+- [Docker](https://docs.docker.com/get-docker/) (daemon running)
+- [kind](https://kind.sigs.k8s.io/docs/user/quick-start/#installation)
+- [kubectl](https://kubernetes.io/docs/tasks/tools/)
+- `curl`
+
+### Run it
 
 ```bash
-export PATH="$HOME/bin:$HOME/go-sdk/bin:$PATH"
-kind version
-go version
-kubectl get nodes --context kind-treeward
+make quickstart
 ```
 
-### Deploy
+`make quickstart` is idempotent and handles everything from a clean checkout:
+
+1. Checks prerequisites and Docker availability.
+2. Generates random `TREEWARD_BOOTSTRAP_TOKEN` and `TREEWARD_LOCAL_TOKEN` secrets into `.treeward/quickstart.env` (mode `0600`, gitignored) on first run, reusing them on subsequent runs (or honoring explicit env overrides).
+3. Creates a dedicated Kind cluster named `treeward-quickstart` (skips creation if it already exists).
+4. Builds the `treeward:quickstart` image, loads it into Kind, and builds `./bin/treeward`.
+5. Applies Kubernetes Secrets and `deploy/k8s/treeward.yaml`, then waits for `treeward-api`, `treeward-connector`, and `treeward-agent` rollouts.
+6. Port-forwards `svc/treeward-api` to `127.0.0.1:8080` in the background (tracked via `.treeward/port-forward.pid`).
+7. Mints an operator bearer token (`TREEWARD_TOKEN`) via `POST /v1/tokens` and saves it to `.treeward/quickstart.env`.
+8. Runs the end-to-end demo (`scripts/demo.sh`) with pass/fail output per step.
+
+### What the demo shows
+
+`make demo` (run automatically at the end of `make quickstart`) authenticates with `TREEWARD_TOKEN` and verifies the full control-plane lifecycle against the stub fleet:
+
+- **Health & inventory:** confirms the API is reachable and 3 stub nodes (`*-canary`, `*-n1`, `*-n2`) are reporting through the connector.
+- **Artifact & binding:** registers a demo artifact (SHA-256 digest) and creates a `draft` binding.
+- **Approve:** approves the binding (audit actor derived from the authenticated operator token).
+- **Canary:** rolls out to the `treeward.ai/rollout=canary` node only and verifies non-canary nodes remain untouched.
+- **Promote:** promotes the binding fleet-wide and verifies all nodes load the digest.
+- **Attest:** runs an attestation campaign and verifies stub quotes pass on all nodes.
+- **Revert:** reverts the binding and verifies all nodes unload the digest.
+- **Audit:** verifies `approve`, `canary`, `promote`, `attest.start`, and `revert` are recorded in the audit log.
+
+To use the CLI interactively after `make quickstart`:
 
 ```bash
-cd ~/src/treeward
-make deploy          # build image, kind load, apply manifests
-make port-forward    # in another terminal → localhost:8080
-make demo            # approve → canary → promote → revert
-```
-
-### CLI
-
-```bash
-export TREEWARD_API_URL=http://127.0.0.1:8080
+set -a; source .treeward/quickstart.env; set +a
 ./bin/treeward nodes
-./bin/treeward attest   # nonce → stub quotes → pass/fail posture
-./bin/treeward demo     # approve → canary → promote → attest → revert
-./bin/treeward bindings # status includes paused after hard fail
-./bin/treeward audit    # look for action=pause
+./bin/treeward bindings
+./bin/treeward audit
 ```
 
-### Pause on hard fail
+### Teardown
+
+```bash
+make teardown
+```
+
+Stops the background port-forward, deletes the `treeward-quickstart` Kind cluster (without touching any other Kind cluster), and removes `.treeward/`. To preserve `.treeward/quickstart.env` across rebuilds:
+
+```bash
+./scripts/teardown.sh --keep-state
+```
+
+### Troubleshooting
+
+- **Port `8080` already in use:** Quickstart refuses to clobber another process bound to `127.0.0.1:8080`. Choose an alternate local port:
+  ```bash
+  TREEWARD_API_PORT=18080 make quickstart
+  ```
+- **Docker daemon not reachable:** Start Docker Desktop or the `dockerd` service and verify `docker info` succeeds.
+- **Pods fail to start or stay Pending:** Inspect cluster state and logs:
+  ```bash
+  make status
+  make logs
+  ```
+- **401 Unauthorized after changing secrets:** If you rotated `TREEWARD_BOOTSTRAP_TOKEN`, run `make teardown && make quickstart` to recreate the cluster secrets and mint a fresh operator token.
+
+## Pause on hard fail
 
 After canary, a **hard failure** sets the binding to `paused` (no auto-revert; human chooses revert or continue later). Promote is rejected while paused.
 
 | Trigger | How to demo |
 |---------|-------------|
-| Attest verify fail on a canary-labeled node | Agent env `TREEWARD_ATTEST_FAIL=<node-id>` (e.g. `kind-worker-canary`), then `treeward canary …` + `treeward attest` |
+| Attest verify fail on a canary-labeled node | Agent env `TREEWARD_ATTEST_FAIL=<node-id>` (e.g. `treeward-quickstart-control-plane-canary`), then `treeward canary …` + `treeward attest` |
 | Upatch load error on canary set | Agent env `TREEWARD_LOAD_FAIL=1`, then canary a binding — stub agent reports `load error: <digest>` |
 
-`treeward demo` keeps the happy path (no fail envs).
-
-### Layout
+## Layout
 
 ```
 cmd/api|connector|agent|treeward
-internal/{api,store,signer,types}
+internal/{api,runtime,signer,store,types}
 deploy/k8s/treeward.yaml
+scripts/{quickstart,demo,teardown}.sh
 ```
 
-### Shirudo runtime revert & ownership
+## Shirudo runtime (advanced)
 
-When running the agent with `TREEWARD_RUNTIME=shirudo`:
+Quickstart runs with `TREEWARD_RUNTIME=stub` (no kernel enforcement). Running with real eBPF upatch enforcement via [Shirudo](https://docs.shirudo.dev/) is a separate, advanced setup on Linux hosts/VMs with `shirudo-runtime` installed and `TREEWARD_RUNTIME=shirudo`:
 
 - **Signed unload directives:** Operators build a signed UNLOAD directive alongside each upatch artifact using the convention `<SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. Treeward never holds the operator signing key; on revert, the agent invokes `shirudo-runtime upatch unload <SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. If the directive file is missing, the agent logs an error and skips the unload call.
 - **Ownership tracking:** The agent persists the set of upatches that have appeared in a Treeward desired state in `<SHIRUDO_STATE_DIR>/owned.json` (default `/var/lib/treeward-agent/owned.json`). Externally loaded upatches not present in `owned.json` (such as `app-sandbox`) are never unloaded by Treeward.

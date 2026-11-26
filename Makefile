@@ -1,8 +1,16 @@
-IMAGE ?= treeward:mvp
-CONTEXT ?= kind-treeward
+IMAGE ?= treeward:quickstart
+CLUSTER ?= treeward-quickstart
+CONTEXT ?= kind-$(CLUSTER)
 NAMESPACE ?= treeward
+TEARDOWN_ARGS ?=
 
-.PHONY: build build-local image load deploy wait demo logs status port-forward
+.PHONY: quickstart teardown build-local image load deploy wait demo logs status port-forward
+
+quickstart:
+	./scripts/quickstart.sh
+
+teardown:
+	./scripts/teardown.sh $(TEARDOWN_ARGS)
 
 build-local:
 	mkdir -p bin
@@ -15,7 +23,7 @@ image:
 	docker build -t $(IMAGE) .
 
 load: image
-	kind load docker-image $(IMAGE) --name treeward
+	kind load docker-image $(IMAGE) --name $(CLUSTER)
 
 deploy: load
 	kubectl --context $(CONTEXT) apply -f deploy/k8s/treeward.yaml
@@ -35,7 +43,7 @@ logs:
 	kubectl --context $(CONTEXT) -n $(NAMESPACE) logs -l app=treeward-agent --tail=50
 
 port-forward:
-	kubectl --context $(CONTEXT) -n $(NAMESPACE) port-forward svc/treeward-api 8080:8080
+	kubectl --context $(CONTEXT) -n $(NAMESPACE) port-forward --address 127.0.0.1 svc/treeward-api 8080:8080
 
 demo: build-local
 	./scripts/demo.sh

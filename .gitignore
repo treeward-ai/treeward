@@ -4,6 +4,7 @@ bin/
 *.out
 
 # local state / secrets
+.treeward/
 *.db
 *.db-shm
 *.db-wal
