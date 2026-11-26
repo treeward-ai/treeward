@@ -48,12 +48,12 @@ func main() {
 		log.Printf("WARNING: TREEWARD_AUTH=off — admin API authentication is DISABLED (local development only)")
 	}
 	if *shirudoBin != "" {
-		srv.Verifier = api.NewShirudoVerifier(api.ShirudoVerifierConfig{
-			Bin:              *shirudoBin,
-			AKName:           *shirudoAKName,
-			ExpectConfigRoot: *shirudoExpectConfigRoot,
-			ExpectConfigPCR:  *shirudoExpectConfigPCR,
-		})
+		cfg := api.ShirudoVerifierConfigFromEnv()
+		cfg.Bin = *shirudoBin
+		cfg.AKName = *shirudoAKName
+		cfg.ExpectConfigRoot = *shirudoExpectConfigRoot
+		cfg.ExpectConfigPCR = *shirudoExpectConfigPCR
+		srv.Verifier = api.NewShirudoVerifier(cfg)
 		log.Printf("shirudo attest verifier enabled (bin=%s)", *shirudoBin)
 	}
 	log.Printf("treeward api listening on %s", addr)

@@ -385,16 +385,17 @@ echo "unexpected args: $@" >&2
 exit 1
 `)
 
+	nonce := "a1b2c3d4e5f60718"
 	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithStateDir(t.TempDir()))
 	nodes := []types.Node{{ID: "node-1"}}
-	results, err := rt.Attest("a1b2c3d4", nodes, nil)
+	results, err := rt.Attest(nonce, nodes, nil)
 	if err != nil {
 		t.Fatalf("Attest() error: %v", err)
 	}
 	if len(results) != 1 {
 		t.Fatalf("len(results) = %d, want 1", len(results))
 	}
-	if results[0].NodeID != "node-1" || results[0].Nonce != "a1b2c3d4" {
+	if results[0].NodeID != "node-1" || results[0].Nonce != nonce {
 		t.Fatalf("unexpected attest result metadata: %+v", results[0])
 	}
 
@@ -402,13 +403,144 @@ exit 1
 	if err := json.Unmarshal([]byte(results[0].Quote), &doc); err != nil {
 		t.Fatalf("Quote is not valid JSON: %v (%q)", err, results[0].Quote)
 	}
-	if doc["nonce"] != "a1b2c3d4" {
-		t.Fatalf("doc[nonce] = %v, want a1b2c3d4", doc["nonce"])
+	if doc["nonce"] != nonce {
+		t.Fatalf("doc[nonce] = %v, want %s", doc["nonce"], nonce)
 	}
 
 	calls := readCallLog(t, logPath)
-	if !reflect.DeepEqual(calls, []string{"attest --nonce a1b2c3d4"}) {
-		t.Fatalf("calls = %v, want [attest --nonce a1b2c3d4]", calls)
+	if !reflect.DeepEqual(calls, []string{"attest --nonce " + nonce}) {
+		t.Fatalf("calls = %v, want [attest --nonce %s]", calls, nonce)
+	}
+}
+
+func TestShirudoRejectsPathTraversalAndFlagInjection(t *testing.T) {
+	bin, logPath := writeFakeShirudo(t, `
+case "$1" in
+  status)
+    echo '{"status":"ok","upatches_loaded":[]}'
+    exit 0
+    ;;
+  upatch|attest)
+    echo "should not be invoked with untrusted args: $@" >&2
+    exit 1
+    ;;
+esac
+exit 1
+`)
+
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+	rt := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+	)
+
+	badNames := []string{
+		"../evil",
+		"foo/../bar",
+		"/etc/passwd",
+		`..\evil`,
+		"--help",
+		"-v",
+		"",
+		"bad name",
+	}
+
+	// Apply must reject all bad upatch names without calling shirudo-runtime upatch load.
+	loaded, errs, err := rt.Apply(types.DesiredState{
+		Nodes: map[string][]string{"node-1": badNames},
+	})
+	if err != nil {
+		t.Fatalf("Apply() top-level error: %v", err)
+	}
+	if len(loaded["node-1"]) != 0 {
+		t.Fatalf("loaded[node-1] = %v, want empty", loaded["node-1"])
+	}
+	if len(errs["node-1"]) != len(badNames) {
+		t.Fatalf("len(errs[node-1]) = %d, want %d (errs=%v)", len(errs["node-1"]), len(badNames), errs["node-1"])
+	}
+
+	// UnloadUpatch must reject all bad upatch names.
+	for _, name := range badNames {
+		if err := rt.UnloadUpatch(name); err == nil {
+			t.Fatalf("UnloadUpatch(%q) expected error, got nil", name)
+		}
+	}
+
+	// LoadUpatch must reject leading dashes and parent traversal segments.
+	for _, p := range []string{"--help", "-x", "../evil.upatch", "/var/lib/../etc/passwd", ""} {
+		if err := rt.LoadUpatch(p); err == nil {
+			t.Fatalf("LoadUpatch(%q) expected error, got nil", p)
+		}
+	}
+
+	// AttestRaw must reject flag injection and malformed nonces.
+	for _, nonce := range []string{"--help", "-n", "a1b2c3d4", "zzzzzzzzzzzzzzzz", "0123456789abcdef --extra", ""} {
+		if _, err := rt.AttestRaw(nonce); err == nil {
+			t.Fatalf("AttestRaw(%q) expected error, got nil", nonce)
+		}
+	}
+
+	// Only the single status --json call from Apply should have executed.
+	calls := readCallLog(t, logPath)
+	if !reflect.DeepEqual(calls, []string{"status --json"}) {
+		t.Fatalf("calls = %v, want [status --json]", calls)
+	}
+}
+
+func TestShirudoLoadUpatchAllowsLegitimateAbsolutePath(t *testing.T) {
+	bin, logPath := writeFakeShirudo(t, `
+if [ "$1" = "upatch" ] && [ "$2" = "load" ] && [ -n "$3" ]; then
+  exit 0
+fi
+exit 1
+`)
+	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"))
+	absPath := filepath.Join(t.TempDir(), "patch-1.upatch")
+	if err := rt.LoadUpatch(absPath); err != nil {
+		t.Fatalf("LoadUpatch(%q) unexpected error: %v", absPath, err)
+	}
+	calls := readCallLog(t, logPath)
+	if !reflect.DeepEqual(calls, []string{"upatch load " + absPath}) {
+		t.Fatalf("calls = %v, want [upatch load %s]", calls, absPath)
+	}
+}
+
+func TestShirudoOwnedStatePermissions(t *testing.T) {
+	bin, _ := writeFakeShirudo(t, `
+case "$1" in
+  status)
+    echo '{"status":"ok","upatches_loaded":[]}'
+    exit 0
+    ;;
+  upatch)
+    exit 0
+    ;;
+esac
+exit 1
+`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithStateDir(stateDir))
+	if _, _, err := rt.Apply(types.DesiredState{Nodes: map[string][]string{"node-1": {"patch-a"}}}); err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+
+	dirInfo, err := os.Stat(stateDir)
+	if err != nil {
+		t.Fatalf("stat stateDir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("stateDir perm = %o, want 700", perm)
+	}
+
+	fileInfo, err := os.Stat(filepath.Join(stateDir, "owned.json"))
+	if err != nil {
+		t.Fatalf("stat owned.json: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("owned.json perm = %o, want 600", perm)
 	}
 }
 
