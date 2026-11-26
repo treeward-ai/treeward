@@ -28,6 +28,7 @@ type Store struct {
 	Tree       []types.TreeOp
 	Audit      []types.AuditEvent
 	Campaigns  map[string]*types.AttestCampaign
+	tokens     map[string]*storedToken // by token ID
 }
 
 // New returns an in-memory store (tests / no persistence).
@@ -40,6 +41,7 @@ func New(bootstrap string, s signer.Signer) *Store {
 		Artifacts:      map[string]*types.Artifact{},
 		Bindings:       map[string]*types.Binding{},
 		Campaigns:      map[string]*types.AttestCampaign{},
+		tokens:         map[string]*storedToken{},
 	}
 }
 
@@ -394,8 +396,15 @@ func (s *Store) ListAudit() []types.AuditEvent {
 }
 
 func (s *Store) StartAttestCampaign() types.AttestCampaign {
+	return s.StartAttestCampaignBy("api")
+}
+
+func (s *Store) StartAttestCampaignBy(actor string) types.AttestCampaign {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if actor == "" {
+		actor = "api"
+	}
 	var nonce [16]byte
 	_, _ = rand.Read(nonce[:])
 	c := types.AttestCampaign{
@@ -410,7 +419,7 @@ func (s *Store) StartAttestCampaign() types.AttestCampaign {
 	for _, n := range s.Nodes {
 		n.AttestStatus = "unknown"
 	}
-	s.auditLocked("attest.start", "api", "", "", "nonce="+c.Nonce)
+	s.auditLocked("attest.start", actor, "", "", "nonce="+c.Nonce)
 	s.persistLocked()
 	return c
 }

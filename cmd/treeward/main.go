@@ -54,9 +54,38 @@ func main() {
 		runAttest(api)
 	case "demo":
 		runDemo(api)
+	case "token":
+		runToken(api)
 	default:
 		usage()
 		os.Exit(2)
+	}
+}
+
+func runToken(api string) {
+	if len(os.Args) < 3 {
+		fatal(fmt.Errorf("usage: treeward token create <name> | list | revoke <id>"))
+	}
+	switch os.Args[2] {
+	case "create":
+		name := mustArg(3, "token name required")
+		bootstrap := env("TREEWARD_BOOTSTRAP_TOKEN", "dev-bootstrap")
+		var raw json.RawMessage
+		doRequest(http.MethodPost, api+"/v1/tokens", types.CreateTokenRequest{Name: name}, bootstrap, &raw)
+		var buf bytes.Buffer
+		_ = json.Indent(&buf, raw, "", "  ")
+		fmt.Println(buf.String())
+	case "list":
+		getPrint(api + "/v1/tokens")
+	case "revoke":
+		id := mustArg(3, "token id required")
+		var raw json.RawMessage
+		doRequest(http.MethodDelete, api+"/v1/tokens/"+id, nil, os.Getenv("TREEWARD_TOKEN"), &raw)
+		var buf bytes.Buffer
+		_ = json.Indent(&buf, raw, "", "  ")
+		fmt.Println(buf.String())
+	default:
+		fatal(fmt.Errorf("unknown token subcommand %q (expected create|list|revoke)", os.Args[2]))
 	}
 }
 
@@ -188,8 +217,14 @@ Usage:
   treeward approve|canary|promote|revert <binding-id> [actor]
   treeward attest
   treeward demo
+  treeward token create <name>
+  treeward token list
+  treeward token revoke <id>
 
-Env: TREEWARD_API_URL (default http://127.0.0.1:8080)
+Env:
+  TREEWARD_API_URL         (default http://127.0.0.1:8080)
+  TREEWARD_TOKEN           (operator bearer token for admin routes)
+  TREEWARD_BOOTSTRAP_TOKEN (bootstrap token for 'token create', default dev-bootstrap)
 
 Pause-on-hard-fail (binding → paused; no auto-revert; promote rejected):
   Attest: set agent TREEWARD_ATTEST_FAIL=<canary-node-id> (e.g. kind-worker-canary),
@@ -216,25 +251,33 @@ func postPrint(url string, body any) {
 }
 
 func mustGet(url string, out any) {
-	res, err := http.Get(url)
-	if err != nil {
-		fatal(err)
-	}
-	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
-	if res.StatusCode >= 300 {
-		fatal(fmt.Errorf("%s: %s", res.Status, data))
-	}
-	if out != nil {
-		if err := json.Unmarshal(data, out); err != nil {
-			fatal(err)
-		}
-	}
+	doRequest(http.MethodGet, url, nil, os.Getenv("TREEWARD_TOKEN"), out)
 }
 
 func mustPost(url string, body any, out any) {
-	b, _ := json.Marshal(body)
-	res, err := http.Post(url, "application/json", bytes.NewReader(b))
+	doRequest(http.MethodPost, url, body, os.Getenv("TREEWARD_TOKEN"), out)
+}
+
+func doRequest(method, url string, body any, bearer string, out any) {
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			fatal(err)
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		fatal(err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fatal(err)
 	}

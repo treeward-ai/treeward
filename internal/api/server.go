@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -9,10 +11,13 @@ import (
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
+type ctxKeyOperatorToken struct{}
+
 type Server struct {
-	Store    *store.Store
-	Mux      *http.ServeMux
-	Verifier AttestVerifier
+	Store        *store.Store
+	Mux          *http.ServeMux
+	Verifier     AttestVerifier
+	AuthDisabled bool
 }
 
 func New(st *store.Store) *Server {
@@ -37,23 +42,103 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/desired", s.withConnector(s.handleDesired))
 	s.Mux.HandleFunc("POST /v1/agents/report", s.withConnector(s.handleAgentReport))
 
-	s.Mux.HandleFunc("GET /v1/nodes", s.handleListNodes)
-	s.Mux.HandleFunc("POST /v1/artifacts", s.handleCreateArtifact)
-	s.Mux.HandleFunc("GET /v1/artifacts", s.handleListArtifacts)
-	s.Mux.HandleFunc("POST /v1/bindings", s.handleCreateBinding)
-	s.Mux.HandleFunc("GET /v1/bindings", s.handleListBindings)
-	s.Mux.HandleFunc("GET /v1/bindings/{id}", s.handleGetBinding)
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/approve", s.handleApprove)
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/canary", s.handleCanary)
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/promote", s.handlePromote)
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/revert", s.handleRevert)
-	s.Mux.HandleFunc("GET /v1/tree", s.handleTree)
-	s.Mux.HandleFunc("GET /v1/audit", s.handleAudit)
-	s.Mux.HandleFunc("POST /v1/attest/campaigns", s.handleStartAttest)
-	s.Mux.HandleFunc("GET /v1/attest/campaigns", s.handleListAttest)
+	s.Mux.HandleFunc("POST /v1/tokens", s.withBootstrap(s.handleCreateToken))
+	s.Mux.HandleFunc("GET /v1/tokens", s.withOperator(s.handleListTokens))
+	s.Mux.HandleFunc("DELETE /v1/tokens/{id}", s.withOperator(s.handleRevokeToken))
+
+	s.Mux.HandleFunc("GET /v1/nodes", s.withOperator(s.handleListNodes))
+	s.Mux.HandleFunc("POST /v1/artifacts", s.withOperator(s.handleCreateArtifact))
+	s.Mux.HandleFunc("GET /v1/artifacts", s.withOperator(s.handleListArtifacts))
+	s.Mux.HandleFunc("POST /v1/bindings", s.withOperator(s.handleCreateBinding))
+	s.Mux.HandleFunc("GET /v1/bindings", s.withOperator(s.handleListBindings))
+	s.Mux.HandleFunc("GET /v1/bindings/{id}", s.withOperator(s.handleGetBinding))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/approve", s.withOperator(s.handleApprove))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/canary", s.withOperator(s.handleCanary))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/promote", s.withOperator(s.handlePromote))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/revert", s.withOperator(s.handleRevert))
+	s.Mux.HandleFunc("GET /v1/tree", s.withOperator(s.handleTree))
+	s.Mux.HandleFunc("GET /v1/audit", s.withOperator(s.handleAudit))
+	s.Mux.HandleFunc("POST /v1/attest/campaigns", s.withOperator(s.handleStartAttest))
+	s.Mux.HandleFunc("GET /v1/attest/campaigns", s.withOperator(s.handleListAttest))
 	s.Mux.HandleFunc("GET /v1/attest/active", s.withConnector(s.handleActiveAttest))
-	s.Mux.HandleFunc("GET /v1/attest/campaigns/{id}", s.handleGetAttest)
+	s.Mux.HandleFunc("GET /v1/attest/campaigns/{id}", s.withOperator(s.handleGetAttest))
 	s.Mux.HandleFunc("POST /v1/attest/campaigns/{id}/results", s.withConnector(s.handleAttestResults))
+}
+
+func bearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+}
+
+func (s *Server) withOperator(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.AuthDisabled {
+			next(w, r)
+			return
+		}
+		raw := bearerToken(r)
+		tok, ok := s.Store.AuthenticateToken(raw)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxKeyOperatorToken{}, tok)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+func (s *Server) withBootstrap(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw := bearerToken(r)
+		if raw == "" || s.Store.BootstrapToken == "" || subtle.ConstantTimeCompare([]byte(raw), []byte(s.Store.BootstrapToken)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func operatorTokenFromContext(ctx context.Context) *types.APIToken {
+	tok, _ := ctx.Value(ctxKeyOperatorToken{}).(*types.APIToken)
+	return tok
+}
+
+func actorFromRequest(r *http.Request, fallback string) string {
+	if tok := operatorTokenFromContext(r.Context()); tok != nil && tok.Name != "" {
+		return tok.Name
+	}
+	return fallback
+}
+
+func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
+	var req types.CreateTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp, err := s.Store.CreateToken(req.Name, req.ExpiresAt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleListTokens(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.Store.ListTokens())
+}
+
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	actor := actorFromRequest(r, "operator")
+	tok, err := s.Store.RevokeToken(r.PathValue("id"), actor)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, tok)
 }
 
 func (s *Server) withConnector(next http.HandlerFunc) http.HandlerFunc {
@@ -159,7 +244,7 @@ func (s *Server) handleGetBinding(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	b, err := s.Store.Approve(r.PathValue("id"), req.Actor)
+	b, err := s.Store.Approve(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -170,7 +255,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	b, err := s.Store.Canary(r.PathValue("id"), req.Actor)
+	b, err := s.Store.Canary(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -181,7 +266,7 @@ func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	b, err := s.Store.Promote(r.PathValue("id"), req.Actor)
+	b, err := s.Store.Promote(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -192,7 +277,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	b, err := s.Store.Revert(r.PathValue("id"), req.Actor)
+	b, err := s.Store.Revert(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -208,8 +293,8 @@ func (s *Server) handleAudit(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Store.ListAudit())
 }
 
-func (s *Server) handleStartAttest(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusCreated, s.Store.StartAttestCampaign())
+func (s *Server) handleStartAttest(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusCreated, s.Store.StartAttestCampaignBy(actorFromRequest(r, "api")))
 }
 
 func (s *Server) handleListAttest(w http.ResponseWriter, _ *http.Request) {

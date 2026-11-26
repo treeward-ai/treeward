@@ -43,6 +43,14 @@ CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value BLOB NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT,
+  revoked INTEGER NOT NULL DEFAULT 0
 );`); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -57,6 +65,7 @@ CREATE TABLE IF NOT EXISTS kv (
 		Artifacts:      map[string]*types.Artifact{},
 		Bindings:       map[string]*types.Binding{},
 		Campaigns:      map[string]*types.AttestCampaign{},
+		tokens:         map[string]*storedToken{},
 	}
 	if err := s.load(); err != nil {
 		_ = db.Close()
@@ -76,7 +85,7 @@ func (s *Store) load() error {
 	var raw []byte
 	err := s.db.QueryRow(`SELECT value FROM kv WHERE key = ?`, "state").Scan(&raw)
 	if err == sql.ErrNoRows {
-		return nil
+		return s.loadTokens()
 	}
 	if err != nil {
 		return err
@@ -106,7 +115,7 @@ func (s *Store) load() error {
 	if snap.Campaigns != nil {
 		s.Campaigns = snap.Campaigns
 	}
-	return nil
+	return s.loadTokens()
 }
 
 // persistLocked writes the in-memory state. Caller must hold s.mu.

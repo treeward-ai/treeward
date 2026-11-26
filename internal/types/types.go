@@ -121,3 +121,21 @@ type AgentReport struct {
 	Loaded []string `json:"loaded"`
 	Errors []string `json:"errors,omitempty"`
 }
+
+type APIToken struct {
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	CreatedAt time.Time  `json:"createdAt"`
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+	Revoked   bool       `json:"revoked"`
+}
+
+type CreateTokenRequest struct {
+	Name      string     `json:"name"`
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+}
+
+type CreateTokenResponse struct {
+	APIToken
+	Token string `json:"token"`
+}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/treeward-ai/treeward/internal/api"
 	"github.com/treeward-ai/treeward/internal/signer"
@@ -39,6 +40,10 @@ func main() {
 	log.Printf("sqlite store %s (connectors=%d artifacts=%d)", dbPath, len(st.Connectors), len(st.Artifacts))
 
 	srv := api.New(st)
+	if strings.EqualFold(os.Getenv("TREEWARD_AUTH"), "off") {
+		srv.AuthDisabled = true
+		log.Printf("WARNING: TREEWARD_AUTH=off — admin API authentication is DISABLED (local development only)")
+	}
 	if *shirudoBin != "" {
 		srv.Verifier = api.NewShirudoVerifier(api.ShirudoVerifierConfig{
 			Bin:              *shirudoBin,
