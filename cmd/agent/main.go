@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -12,17 +13,24 @@ import (
 	"time"
 
 	"github.com/treeward-ai/treeward/internal/runtime"
+	"github.com/treeward-ai/treeward/internal/signer"
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
-// Node agent: poll connector desired state → runtime.Apply → report →
-// poll attest → runtime.Attest → submit. Backend selected via --runtime or TREEWARD_RUNTIME.
+// Node agent: poll connector desired state → verify signed tree (when pinned) →
+// runtime.Apply → report → poll attest → runtime.Attest → submit.
+// Backend selected via --runtime or TREEWARD_RUNTIME.
 func main() {
 	runtimeFlag := flag.String("runtime", env("TREEWARD_RUNTIME", "stub"), "runtime backend (stub|mock|shirudo)")
 	flag.Parse()
 
 	connector := env("TREEWARD_CONNECTOR_URL", "http://treeward-connector:8090")
 	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
+	treePubKey, err := validateTreeVerifyConfig(envBool("TREEWARD_VERIFY_TREE"), os.Getenv("TREEWARD_TREE_PUBKEY"))
+	if err != nil {
+		log.Fatalf("tree verify config: %v", err)
+	}
+
 	kind := *runtimeFlag
 	rt, err := runtime.New(kind)
 	if err != nil {
@@ -34,9 +42,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("inventory: %v", err)
 	}
-	log.Printf("agent starting runtime=%s nodes=%d → %s", kind, len(nodes), connector)
+	log.Printf("agent starting runtime=%s nodes=%d verify_tree=%v → %s", kind, len(nodes), treePubKey != "", connector)
 
 	var lastAttest string
+	var lastVerifiedSeq int64
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -47,9 +56,9 @@ func main() {
 		if err != nil {
 			log.Printf("desired: %v", err)
 		} else {
-			loaded, applyErrs, err = rt.Apply(desired)
+			loaded, applyErrs, lastVerifiedSeq, err = applyDesiredState(rt, treePubKey, lastVerifiedSeq, desired, nodes)
 			if err != nil {
-				log.Printf("apply: %v", err)
+				log.Printf("%v", err)
 			} else {
 				for id, digests := range loaded {
 					log.Printf("node=%s loaded=%v", id, digests)
@@ -192,9 +201,68 @@ type httpError struct {
 
 func (e *httpError) Error() string { return e.body }
 
+func validateTreeVerifyConfig(verifyTree bool, pubKeyHex string) (string, error) {
+	pubKeyHex = strings.TrimSpace(pubKeyHex)
+	if verifyTree && pubKeyHex == "" {
+		return "", fmt.Errorf("TREEWARD_VERIFY_TREE is enabled but TREEWARD_TREE_PUBKEY is empty")
+	}
+	if pubKeyHex != "" {
+		if _, err := signer.ParsePublicKeyHex(pubKeyHex); err != nil {
+			return "", fmt.Errorf("invalid TREEWARD_TREE_PUBKEY: %w", err)
+		}
+	}
+	return pubKeyHex, nil
+}
+
+// verifyAndResolveDesired verifies the full Ed25519 hash-chained TreeOp log,
+// enforces monotonic TreeSeq >= lastSeq to prevent rollback/truncation, and
+// locally replays desired digests for each node owned by this agent—completely
+// ignoring the server/connector's unsigned desired.Nodes map.
+func verifyAndResolveDesired(pubKeyHex string, lastSeq int64, desired types.DesiredState, nodes []types.Node) (types.DesiredState, int64, error) {
+	if desired.TreeSeq != int64(len(desired.Ops)) {
+		return types.DesiredState{}, lastSeq, fmt.Errorf("desired treeSeq %d does not match ops length %d", desired.TreeSeq, len(desired.Ops))
+	}
+	if err := signer.VerifyTreeChainFrom(pubKeyHex, desired.Ops, lastSeq); err != nil {
+		return types.DesiredState{}, lastSeq, err
+	}
+	verifiedNodes := make(map[string][]string, len(nodes))
+	for _, n := range nodes {
+		verifiedNodes[n.ID] = signer.ReplayDesiredForNode(desired.Ops, n.Labels)
+	}
+	resolved := types.DesiredState{
+		TreeSeq:    desired.TreeSeq,
+		TreePubKey: pubKeyHex,
+		Ops:        desired.Ops,
+		Nodes:      verifiedNodes,
+	}
+	return resolved, desired.TreeSeq, nil
+}
+
+func applyDesiredState(rt runtime.Runtime, pubKeyHex string, lastSeq int64, desired types.DesiredState, nodes []types.Node) (map[string][]string, map[string][]string, int64, error) {
+	toApply := desired
+	nextSeq := lastSeq
+	if pubKeyHex != "" {
+		var err error
+		toApply, nextSeq, err = verifyAndResolveDesired(pubKeyHex, lastSeq, desired, nodes)
+		if err != nil {
+			return nil, nil, lastSeq, fmt.Errorf("tree verify failed (skipping apply): %w", err)
+		}
+	}
+	loaded, applyErrs, err := rt.Apply(toApply)
+	if err != nil {
+		return nil, nil, nextSeq, fmt.Errorf("apply: %w", err)
+	}
+	return loaded, applyErrs, nextSeq, nil
+}
+
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
 	}
 	return def
+}
+
+func envBool(k string) bool {
+	v := strings.TrimSpace(os.Getenv(k))
+	return v == "1" || strings.EqualFold(v, "true")
 }
