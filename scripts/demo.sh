@@ -9,6 +9,7 @@ ENV_FILE="${ROOT}/.treeward/quickstart.env"
 # Preserve explicit caller overrides before loading quickstart.env.
 CALLER_API_URL="${TREEWARD_API_URL:-}"
 CALLER_TOKEN="${TREEWARD_TOKEN:-}"
+CALLER_APPROVER_TOKEN="${TREEWARD_APPROVER_TOKEN:-}"
 
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -17,6 +18,7 @@ fi
 
 export TREEWARD_API_URL="${CALLER_API_URL:-${TREEWARD_API_URL:-http://127.0.0.1:8080}}"
 export TREEWARD_TOKEN="${CALLER_TOKEN:-${TREEWARD_TOKEN:-}}"
+export TREEWARD_APPROVER_TOKEN="${CALLER_APPROVER_TOKEN:-${TREEWARD_APPROVER_TOKEN:-}}"
 
 CLI="$ROOT/bin/treeward"
 PASSED=0
@@ -170,8 +172,8 @@ else
   fail "Create binding (unexpected id=${BINDING_ID} status=${BINDING_STATUS})"
 fi
 
-# 5. Approve binding
-approve_out="$("$CLI" approve "$BINDING_ID" 2>&1)" || fail "Approve binding (${approve_out})"
+# 5. Approve binding (uses distinct approver token to satisfy two-person separation of duties)
+approve_out="$(TREEWARD_TOKEN="${TREEWARD_APPROVER_TOKEN:-${TREEWARD_TOKEN}}" "$CLI" approve "$BINDING_ID" 2>&1)" || fail "Approve binding (${approve_out})"
 APPROVE_STATUS="$(printf '%s\n' "$approve_out" | json_field status)"
 APPROVED_BY="$(printf '%s\n' "$approve_out" | json_field approvedBy)"
 if [[ "$APPROVE_STATUS" == "approved" ]]; then

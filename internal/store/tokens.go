@@ -28,7 +28,7 @@ func (s *Store) loadTokens() error {
 	if s.db == nil {
 		return nil
 	}
-	rows, err := s.db.Query(`SELECT id, name, token_hash, created_at, expires_at, revoked FROM api_tokens`)
+	rows, err := s.db.Query(`SELECT id, name, role, token_hash, created_at, expires_at, revoked FROM api_tokens`)
 	if err != nil {
 		return fmt.Errorf("load api_tokens: %w", err)
 	}
@@ -36,12 +36,18 @@ func (s *Store) loadTokens() error {
 	for rows.Next() {
 		var (
 			tok        storedToken
+			roleStr    sql.NullString
 			createdStr string
 			expiresStr sql.NullString
 			revokedInt int
 		)
-		if err := rows.Scan(&tok.ID, &tok.Name, &tok.TokenHash, &createdStr, &expiresStr, &revokedInt); err != nil {
+		if err := rows.Scan(&tok.ID, &tok.Name, &roleStr, &tok.TokenHash, &createdStr, &expiresStr, &revokedInt); err != nil {
 			return fmt.Errorf("scan api_token: %w", err)
+		}
+		if roleStr.Valid && strings.TrimSpace(roleStr.String) != "" {
+			tok.Role = strings.ToLower(strings.TrimSpace(roleStr.String))
+		} else {
+			tok.Role = types.RoleAdmin
 		}
 		if t, err := time.Parse(time.RFC3339Nano, createdStr); err == nil {
 			tok.CreatedAt = t
@@ -57,12 +63,22 @@ func (s *Store) loadTokens() error {
 	return rows.Err()
 }
 
-// CreateToken mints a new operator API token, stores only its SHA-256 hash,
+// CreateToken mints a new admin operator API token, stores only its SHA-256 hash,
 // and returns the raw token once.
 func (s *Store) CreateToken(name string, expiresAt *time.Time) (*types.CreateTokenResponse, error) {
+	return s.CreateTokenWithRole(name, types.RoleAdmin, expiresAt)
+}
+
+// CreateTokenWithRole mints a new operator API token with the specified RBAC role
+// (defaults to admin if empty), stores only its SHA-256 hash, and returns the raw token once.
+func (s *Store) CreateTokenWithRole(name, role string, expiresAt *time.Time) (*types.CreateTokenResponse, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, fmt.Errorf("token name is required")
+	}
+	normRole, err := types.NormalizeRole(role)
+	if err != nil {
+		return nil, err
 	}
 	var rawBytes [32]byte
 	if _, err := rand.Read(rawBytes[:]); err != nil {
@@ -82,6 +98,7 @@ func (s *Store) CreateToken(name string, expiresAt *time.Time) (*types.CreateTok
 		APIToken: types.APIToken{
 			ID:        id("tok"),
 			Name:      name,
+			Role:      normRole,
 			CreatedAt: now,
 			ExpiresAt: expCopy,
 			Revoked:   false,
@@ -97,14 +114,14 @@ func (s *Store) CreateToken(name string, expiresAt *time.Time) (*types.CreateTok
 			expVal = st.ExpiresAt.Format(time.RFC3339Nano)
 		}
 		if _, err := s.db.Exec(
-			`INSERT INTO api_tokens(id, name, token_hash, created_at, expires_at, revoked) VALUES(?,?,?,?,?,0)`,
-			st.ID, st.Name, st.TokenHash, st.CreatedAt.Format(time.RFC3339Nano), expVal,
+			`INSERT INTO api_tokens(id, name, role, token_hash, created_at, expires_at, revoked) VALUES(?,?,?,?,?,?,0)`,
+			st.ID, st.Name, st.Role, st.TokenHash, st.CreatedAt.Format(time.RFC3339Nano), expVal,
 		); err != nil {
 			return nil, fmt.Errorf("insert api_token: %w", err)
 		}
 	}
 	s.tokens[st.ID] = st
-	s.auditLocked("token.create", "admin-bootstrap", "", "", "id="+st.ID+" name="+st.Name)
+	s.auditLocked("token.create", "admin-bootstrap", "", "", "id="+st.ID+" name="+st.Name+" role="+st.Role)
 	s.persistLocked()
 
 	return &types.CreateTokenResponse{

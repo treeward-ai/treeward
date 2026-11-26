@@ -47,11 +47,16 @@ CREATE TABLE IF NOT EXISTS kv (
 CREATE TABLE IF NOT EXISTS api_tokens (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'admin',
   token_hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL,
   expires_at TEXT,
   revoked INTEGER NOT NULL DEFAULT 0
 );`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := migrateAPITokensTable(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -76,6 +81,44 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 		return nil, err
 	}
 	return s, nil
+}
+
+func migrateAPITokensTable(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(api_tokens)`)
+	if err != nil {
+		return fmt.Errorf("inspect api_tokens schema: %w", err)
+	}
+	hasRole := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan api_tokens column info: %w", err)
+		}
+		if name == "role" {
+			hasRole = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !hasRole {
+		if _, err := db.Exec(`ALTER TABLE api_tokens ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'`); err != nil {
+			return fmt.Errorf("migrate api_tokens add role column: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {

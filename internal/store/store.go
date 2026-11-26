@@ -20,11 +20,16 @@ import (
 // or cluster outside its own enrolled cluster.
 var ErrClusterForbidden = errors.New("forbidden: cross-cluster access denied")
 
+// ErrSelfApproveForbidden is returned when the principal who created a binding
+// attempts to approve that same binding while two-person separation of duties is enforced.
+var ErrSelfApproveForbidden = errors.New("forbidden: binding creator cannot approve own binding")
+
 type Store struct {
 	mu sync.RWMutex
 
 	EnrollToken         string
 	AdminBootstrapToken string
+	AllowSelfApprove    bool
 	Signer              signer.Signer
 	db                  *sql.DB
 
@@ -215,6 +220,10 @@ func (s *Store) ListNodes() []types.Node {
 }
 
 func (s *Store) CreateArtifact(a types.Artifact) types.Artifact {
+	return s.CreateArtifactBy(a, "api")
+}
+
+func (s *Store) CreateArtifactBy(a types.Artifact, actor string) types.Artifact {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if a.ID == "" {
@@ -226,9 +235,12 @@ func (s *Store) CreateArtifact(a types.Artifact) types.Artifact {
 	if a.Digest == "" {
 		a.Digest = signer.ArtifactDigest(a.Name, a.Type, a.Fixes)
 	}
+	if actor == "" {
+		actor = "api"
+	}
 	cp := a
 	s.Artifacts[a.ID] = &cp
-	s.auditLocked("artifact.create", "api", "", a.Digest, a.Name)
+	s.auditLocked("artifact.create", actor, "", a.Digest, a.Name)
 	s.persistLocked()
 	return a
 }
@@ -244,6 +256,10 @@ func (s *Store) ListArtifacts() []types.Artifact {
 }
 
 func (s *Store) CreateBinding(b types.Binding) (types.Binding, error) {
+	return s.CreateBindingBy(b, "")
+}
+
+func (s *Store) CreateBindingBy(b types.Binding, actor string) (types.Binding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if b.ArtifactDigest == "" {
@@ -262,15 +278,22 @@ func (s *Store) CreateBinding(b types.Binding) (types.Binding, error) {
 	b.ID = id("bind")
 	b.Status = "draft"
 	b.CreatedAt = time.Now().UTC()
+	if actor != "" {
+		b.CreatedBy = actor
+	}
 	if b.TreeRef == "" {
 		b.TreeRef = "default"
 	}
 	if b.Selector.Labels == nil {
 		b.Selector.Labels = map[string]string{}
 	}
+	auditActor := actor
+	if auditActor == "" {
+		auditActor = "api"
+	}
 	cp := b
 	s.Bindings[b.ID] = &cp
-	s.auditLocked("binding.create", "api", b.ID, b.ArtifactDigest, "")
+	s.auditLocked("binding.create", auditActor, b.ID, b.ArtifactDigest, "")
 	s.persistLocked()
 	return b, nil
 }
@@ -308,6 +331,9 @@ func (s *Store) Approve(bindingID, actor string) (*types.Binding, error) {
 	}
 	if actor == "" {
 		actor = "operator"
+	}
+	if !s.AllowSelfApprove && b.CreatedBy != "" && strings.EqualFold(strings.TrimSpace(b.CreatedBy), strings.TrimSpace(actor)) {
+		return nil, ErrSelfApproveForbidden
 	}
 	b.Status = "approved"
 	b.ApprovedBy = actor

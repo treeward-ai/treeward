@@ -72,3 +72,70 @@ func TestParseCreateArtifactArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCreateTokenArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantName string
+		wantRole string
+		wantErr  bool
+	}{
+		{
+			name:     "name only omits role",
+			args:     []string{"ci-bot"},
+			wantName: "ci-bot",
+			wantRole: "",
+		},
+		{
+			name:     "name with role flag",
+			args:     []string{"alice", "--role", "operator"},
+			wantName: "alice",
+			wantRole: "operator",
+		},
+		{
+			name:     "role equals before name",
+			args:     []string{"--role=APPROVER", "bob"},
+			wantName: "bob",
+			wantRole: "approver",
+		},
+		{
+			name:    "missing name",
+			args:    []string{"--role", "viewer"},
+			wantErr: true,
+		},
+		{
+			name:    "missing role value",
+			args:    []string{"alice", "--role"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid role",
+			args:    []string{"alice", "--role", "root"},
+			wantErr: true,
+		},
+		{
+			name:    "unknown flag",
+			args:    []string{"alice", "--scope", "all"},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseCreateTokenArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Name != tc.wantName || got.Role != tc.wantRole {
+				t.Fatalf("got {Name:%q Role:%q}, want {Name:%q Role:%q}", got.Name, got.Role, tc.wantName, tc.wantRole)
+			}
+		})
+	}
+}

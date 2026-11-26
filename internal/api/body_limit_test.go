@@ -17,6 +17,10 @@ func TestOversizedJSONBodyRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
 	}
+	approver, err := srv.Store.CreateTokenWithRole("size-test-approver", types.RoleApprover, nil)
+	if err != nil {
+		t.Fatalf("CreateTokenWithRole approver: %v", err)
+	}
 
 	// Build a valid JSON payload larger than the 4 MiB limit.
 	oversized := `{"name":"` + strings.Repeat("a", maxJSONBodyBytes+1024) + `","type":"bpf"}`
@@ -56,7 +60,7 @@ func TestOversizedJSONBodyRejected(t *testing.T) {
 	oversizedApprove := `{"actor":"` + strings.Repeat("b", maxJSONBodyBytes+1024) + `"}`
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", bytes.NewBufferString(oversizedApprove))
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("Authorization", "Bearer "+minted.Token)
+	req2.Header.Set("Authorization", "Bearer "+approver.Token)
 	rec2 := httptest.NewRecorder()
 	srv.Mux.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusRequestEntityTooLarge {
@@ -65,7 +69,7 @@ func TestOversizedJSONBodyRejected(t *testing.T) {
 
 	// Empty approve body -> 200.
 	req3 := httptest.NewRequest(http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", nil)
-	req3.Header.Set("Authorization", "Bearer "+minted.Token)
+	req3.Header.Set("Authorization", "Bearer "+approver.Token)
 	rec3 := httptest.NewRecorder()
 	srv.Mux.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusOK {
