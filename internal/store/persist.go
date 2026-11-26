@@ -25,7 +25,7 @@ type snapshot struct {
 }
 
 // Open loads (or creates) a SQLite-backed store at dbPath.
-func Open(dbPath, bootstrap string, sig signer.Signer) (*Store, error) {
+func Open(dbPath, enrollToken, adminBootstrapToken string, sig signer.Signer) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, err
 	}
@@ -57,15 +57,16 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	}
 
 	s := &Store{
-		BootstrapToken: bootstrap,
-		Signer:         sig,
-		db:             db,
-		Connectors:     map[string]*types.Connector{},
-		Nodes:          map[string]*types.Node{},
-		Artifacts:      map[string]*types.Artifact{},
-		Bindings:       map[string]*types.Binding{},
-		Campaigns:      map[string]*types.AttestCampaign{},
-		tokens:         map[string]*storedToken{},
+		EnrollToken:         enrollToken,
+		AdminBootstrapToken: adminBootstrapToken,
+		Signer:              sig,
+		db:                  db,
+		Connectors:          map[string]*types.Connector{},
+		Nodes:               map[string]*types.Node{},
+		Artifacts:           map[string]*types.Artifact{},
+		Bindings:            map[string]*types.Binding{},
+		Campaigns:           map[string]*types.AttestCampaign{},
+		tokens:              map[string]*storedToken{},
 	}
 	if err := s.load(); err != nil {
 		_ = db.Close()

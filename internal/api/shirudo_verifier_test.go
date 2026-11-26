@@ -178,13 +178,13 @@ func TestServer_AttestResults_ShirudoAndMockFallback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("signer: %v", err)
 		}
-		st, err := store.Open(filepath.Join(dir, "treeward.db"), "boot-tok", sig)
+		st, err := store.Open(filepath.Join(dir, "treeward.db"), "enroll-tok", "admin-boot-tok", sig)
 		if err != nil {
 			t.Fatalf("store: %v", err)
 		}
 		t.Cleanup(func() { _ = st.Close() })
 
-		enrolled, err := st.Enroll(types.EnrollRequest{BootstrapToken: "boot-tok", ClusterName: "c1"})
+		enrolled, err := st.Enroll(types.EnrollRequest{BootstrapToken: "enroll-tok", ClusterName: "c1"})
 		if err != nil {
 			t.Fatalf("enroll: %v", err)
 		}

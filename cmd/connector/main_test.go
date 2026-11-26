@@ -75,19 +75,19 @@ func TestCredManagerReenrollClearsStaleTokenAndBacksOff(t *testing.T) {
 	}
 }
 
-func TestCredManagerHaltsOnBootstrapRejection(t *testing.T) {
+func TestCredManagerHaltsOnEnrollTokenRejection(t *testing.T) {
 	calls := 0
-	cm := newCredManager("http://api", "bad-boot", "c1", func(_, _, _ string) (string, string, error) {
+	cm := newCredManager("http://api", "bad-enroll", "c1", func(_, _, _ string) (string, string, error) {
 		calls++
-		return "", "", &httpError{code: http.StatusUnauthorized, body: "invalid bootstrap"}
+		return "", "", &httpError{code: http.StatusUnauthorized, body: "invalid enroll token"}
 	})
 	cm.sleepFn = func(time.Duration) {}
 
 	if err := cm.enrollWithRetry(10); err == nil {
-		t.Fatal("expected error on bootstrap rejection")
+		t.Fatal("expected error on enroll token rejection")
 	}
 	if calls != 1 {
-		t.Fatalf("expected immediate stop on 401 bootstrap, got %d calls", calls)
+		t.Fatalf("expected immediate stop on 401 enroll token, got %d calls", calls)
 	}
 
 	// Subsequent re-enroll should remain halted without calling enrollFn.

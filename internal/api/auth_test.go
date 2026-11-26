@@ -20,7 +20,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("signer: %v", err)
 	}
-	st := store.New("test-bootstrap", sig)
+	st := store.New("test-enroll", "test-admin-bootstrap", sig)
 	return New(st)
 }
 
@@ -73,16 +73,16 @@ func TestAdminAuth_MissingBadRevokedExpiredAndValid(t *testing.T) {
 		t.Fatalf("bad token: got %d, want 401", rec.Code)
 	}
 
-	// POST /v1/tokens requires bootstrap token.
+	// POST /v1/tokens requires admin bootstrap token.
 	if rec := doReq(t, srv, http.MethodPost, "/v1/tokens", "", types.CreateTokenRequest{Name: "op"}); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("POST /v1/tokens without bootstrap: got %d, want 401", rec.Code)
+		t.Fatalf("POST /v1/tokens without admin bootstrap: got %d, want 401", rec.Code)
 	}
 	if rec := doReq(t, srv, http.MethodPost, "/v1/tokens", "wrong-bootstrap", types.CreateTokenRequest{Name: "op"}); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("POST /v1/tokens wrong bootstrap: got %d, want 401", rec.Code)
+		t.Fatalf("POST /v1/tokens wrong admin bootstrap: got %d, want 401", rec.Code)
 	}
 
-	// Mint a valid token with bootstrap token.
-	rec := doReq(t, srv, http.MethodPost, "/v1/tokens", "test-bootstrap", types.CreateTokenRequest{Name: "damian-op"})
+	// Mint a valid token with admin bootstrap token.
+	rec := doReq(t, srv, http.MethodPost, "/v1/tokens", "test-admin-bootstrap", types.CreateTokenRequest{Name: "damian-op"})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("POST /v1/tokens: got %d (%s), want 201", rec.Code, rec.Body.String())
 	}
@@ -123,9 +123,9 @@ func TestHealthzOpenAndConnectorRoutesUnaffected(t *testing.T) {
 		t.Fatalf("GET /healthz: got %d, want 200", rec.Code)
 	}
 
-	// Connector enroll works with bootstrapToken in body (no operator token).
+	// Connector enroll works with enroll token in body (no operator token).
 	rec := doReq(t, srv, http.MethodPost, "/v1/connectors/enroll", "", types.EnrollRequest{
-		BootstrapToken: "test-bootstrap",
+		BootstrapToken: "test-enroll",
 		ClusterName:    "lab",
 	})
 	if rec.Code != http.StatusOK {
@@ -212,5 +212,32 @@ func TestAuthDisabledToggle(t *testing.T) {
 
 	if rec := doReq(t, srv, http.MethodGet, "/v1/nodes", "", nil); rec.Code != http.StatusOK {
 		t.Fatalf("GET /v1/nodes with AuthDisabled=true: got %d, want 200", rec.Code)
+	}
+}
+
+func TestSplitBootstrapSecretsCannotCrossAuthenticate(t *testing.T) {
+	srv := newTestServer(t)
+
+	// Security regression test: a connector's EnrollToken MUST NOT mint admin operator tokens.
+	if rec := doReq(t, srv, http.MethodPost, "/v1/tokens", "test-enroll", types.CreateTokenRequest{Name: "escalated-op"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("POST /v1/tokens with EnrollToken: got %d (%s), want 401", rec.Code, rec.Body.String())
+	}
+
+	// Security regression test: the AdminBootstrapToken MUST NOT enroll connectors.
+	if rec := doReq(t, srv, http.MethodPost, "/v1/connectors/enroll", "", types.EnrollRequest{
+		BootstrapToken: "test-admin-bootstrap",
+		ClusterName:    "lab",
+	}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("POST /v1/connectors/enroll with AdminBootstrapToken: got %d (%s), want 401", rec.Code, rec.Body.String())
+	}
+
+	// Defense-in-depth: if a store is misconfigured with identical tokens, POST /v1/tokens rejects it.
+	sig, err := signer.NewLocal(filepath.Join(t.TempDir(), "keys"))
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	misconfigured := New(store.New("same-secret", "same-secret", sig))
+	if rec := doReq(t, misconfigured, http.MethodPost, "/v1/tokens", "same-secret", types.CreateTokenRequest{Name: "op"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("POST /v1/tokens with identical enroll/admin secrets: got %d, want 401", rec.Code)
 	}
 }

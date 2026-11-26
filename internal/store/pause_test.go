@@ -13,7 +13,7 @@ func testStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New("boot", sig)
+	return New("test-enroll", "test-admin-bootstrap", sig)
 }
 
 func TestPauseOnLoadError(t *testing.T) {

@@ -42,7 +42,7 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/desired", s.withConnector(s.handleDesired))
 	s.Mux.HandleFunc("POST /v1/agents/report", s.withConnector(s.handleAgentReport))
 
-	s.Mux.HandleFunc("POST /v1/tokens", s.withBootstrap(s.handleCreateToken))
+	s.Mux.HandleFunc("POST /v1/tokens", s.withAdminBootstrap(s.handleCreateToken))
 	s.Mux.HandleFunc("GET /v1/tokens", s.withOperator(s.handleListTokens))
 	s.Mux.HandleFunc("DELETE /v1/tokens/{id}", s.withOperator(s.handleRevokeToken))
 
@@ -90,10 +90,12 @@ func (s *Server) withOperator(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) withBootstrap(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) withAdminBootstrap(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		raw := bearerToken(r)
-		if raw == "" || s.Store.BootstrapToken == "" || subtle.ConstantTimeCompare([]byte(raw), []byte(s.Store.BootstrapToken)) != 1 {
+		if raw == "" || s.Store.AdminBootstrapToken == "" ||
+			(s.Store.EnrollToken != "" && subtle.ConstantTimeCompare([]byte(s.Store.AdminBootstrapToken), []byte(s.Store.EnrollToken)) == 1) ||
+			subtle.ConstantTimeCompare([]byte(raw), []byte(s.Store.AdminBootstrapToken)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
