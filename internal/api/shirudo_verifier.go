@@ -52,6 +52,8 @@ type ShirudoVerifyRequest struct {
 
 // ShirudoCheck represents an individual check entry in shirudo's JSON output.
 type ShirudoCheck struct {
+	Result string `json:"result,omitempty"`
+	Text   string `json:"text,omitempty"`
 	Name   string `json:"name,omitempty"`
 	Status string `json:"status,omitempty"`
 	OK     *bool  `json:"ok,omitempty"`
@@ -316,14 +318,20 @@ func (v *ShirudoVerifier) VerifyResult(ctx context.Context, nonce string, res ty
 
 func extractAKName(evidence []byte) string {
 	var envelope struct {
+		AK *struct {
+			Name string `json:"name"`
+		} `json:"ak"`
 		AKNameSnake string `json:"ak_name"`
 		AKNameCamel string `json:"akName"`
 	}
 	if err := json.Unmarshal(evidence, &envelope); err != nil {
 		return ""
 	}
-	if envelope.AKNameSnake != "" {
-		return envelope.AKNameSnake
+	if envelope.AK != nil && strings.TrimSpace(envelope.AK.Name) != "" {
+		return strings.TrimSpace(envelope.AK.Name)
 	}
-	return envelope.AKNameCamel
+	if strings.TrimSpace(envelope.AKNameSnake) != "" {
+		return strings.TrimSpace(envelope.AKNameSnake)
+	}
+	return strings.TrimSpace(envelope.AKNameCamel)
 }
