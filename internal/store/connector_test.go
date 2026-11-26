@@ -18,7 +18,7 @@ func TestConnectorTokenHashingAndPersistence(t *testing.T) {
 		t.Fatalf("signer: %v", err)
 	}
 	dbPath := filepath.Join(dir, "treeward.db")
-	st, err := Open(dbPath, "test-bootstrap", sig)
+	st, err := Open(dbPath, "test-enroll", "test-admin", sig)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -32,13 +32,13 @@ func TestConnectorTokenHashingAndPersistence(t *testing.T) {
 	}
 
 	// Store with empty bootstrap token must reject even empty request token.
-	emptyBootStore := New("", sig)
+	emptyBootStore := New("", "test-admin", sig)
 	if _, err := emptyBootStore.Enroll(types.EnrollRequest{BootstrapToken: "", ClusterName: "c1"}); err == nil {
 		t.Fatal("expected store with empty bootstrap token to reject enroll")
 	}
 
 	resp, err := st.Enroll(types.EnrollRequest{
-		BootstrapToken: "test-bootstrap",
+		BootstrapToken: "test-enroll",
 		ClusterName:    "cluster-a",
 	})
 	if err != nil {
@@ -79,7 +79,7 @@ func TestConnectorTokenHashingAndPersistence(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	st2, err := Open(dbPath, "test-bootstrap", sig)
+	st2, err := Open(dbPath, "test-enroll", "test-admin", sig)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

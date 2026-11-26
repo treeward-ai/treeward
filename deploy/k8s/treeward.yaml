@@ -97,6 +97,9 @@ spec:
             - /bin/sh
             - -c
             - mkdir -p /mnt/data /mnt/keys && chown -R 10001:10001 /mnt/data /mnt/keys && chmod 0700 /mnt/data /mnt/keys
+          # Pod-level runAsNonRoot: true would block chown on the PVC mount;
+          # override runAsNonRoot/runAsUser on this initContainer only so it can
+          # set 10001:10001 ownership before the non-root api container starts.
           securityContext:
             runAsNonRoot: false
             runAsUser: 0
@@ -126,6 +129,9 @@ spec:
           imagePullPolicy: Never
           command: ["/app/api"]
           securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:

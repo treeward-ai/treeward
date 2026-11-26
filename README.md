@@ -108,3 +108,10 @@ Quickstart runs with `TREEWARD_RUNTIME=stub` (no kernel enforcement). Running wi
 
 - **Signed unload directives:** Operators build a signed UNLOAD directive alongside each upatch artifact using the convention `<SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. Treeward never holds the operator signing key; on revert, the agent invokes `shirudo-runtime upatch unload <SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. If the directive file is missing, the agent logs an error and skips the unload call.
 - **Ownership tracking:** The agent persists the set of upatches that have appeared in a Treeward desired state in `<SHIRUDO_STATE_DIR>/owned.json` (default `/var/lib/treeward-agent/owned.json`). Externally loaded upatches not present in `owned.json` (such as `app-sandbox`) are never unloaded by Treeward.
+
+## Security & configuration
+
+See [`SECURITY_MODEL.md`](SECURITY_MODEL.md) for the threat model, signed tree chain verification, and attestation trust boundaries.
+
+- **Split bootstrap & local tokens:** `api` requires distinct `TREEWARD_ENROLL_TOKEN` (connector enrollment) and `TREEWARD_ADMIN_BOOTSTRAP_TOKEN` (operator token minting). `connector` protects `/v1/local/*` with `TREEWARD_LOCAL_TOKEN` and fails closed if unset; set `TREEWARD_LOCAL_AUTH=off` only for local dev.
+- **TLS 1.3:** Set both `TREEWARD_TLS_CERT` and `TREEWARD_TLS_KEY` on `api` or `connector` to serve HTTPS with TLS 1.3 minimum.

@@ -125,7 +125,7 @@ func TestVerifyAndResolveDesiredLifecycleAndIgnoresUnsignedNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := sig.PublicKeyHex()
-	st := store.New("boot", sig)
+	st := store.New("enroll", "admin", sig)
 
 	agentNodes := []types.Node{
 		{
@@ -253,7 +253,7 @@ func TestVerifyAndResolveDesiredRejectsTamperingAndSkipsApply(t *testing.T) {
 	}
 	pub := sig.PublicKeyHex()
 
-	st := store.New("boot", sig)
+	st := store.New("enroll", "admin", sig)
 	nodes := []types.Node{
 		{ID: "n-canary", Labels: map[string]string{types.LabelRollout: types.RolloutCanary}},
 		{ID: "n-prod", Labels: map[string]string{}},
@@ -281,7 +281,7 @@ func TestVerifyAndResolveDesiredRejectsTamperingAndSkipsApply(t *testing.T) {
 	}
 
 	// Build a valid desired state signed by attackerSig to prove agent ignores desired.TreePubKey.
-	attackerStore := store.New("boot", attackerSig)
+	attackerStore := store.New("enroll", "admin", attackerSig)
 	attackerArt := attackerStore.CreateArtifact(types.Artifact{Name: "evil", Type: "bpf"})
 	attackerBind, _ := attackerStore.CreateBinding(types.Binding{ArtifactDigest: attackerArt.Digest})
 	_, _ = attackerStore.Approve(attackerBind.ID, "eve")

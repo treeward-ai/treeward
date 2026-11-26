@@ -13,7 +13,7 @@ import (
 func TestWithConnector_RequiresBearerPrefix(t *testing.T) {
 	srv := newTestServer(t)
 	enrolled, err := srv.Store.Enroll(types.EnrollRequest{
-		BootstrapToken: "test-bootstrap",
+		BootstrapToken: "test-enroll",
 		ClusterName:    "cluster-a",
 	})
 	if err != nil {
@@ -55,14 +55,14 @@ func TestCrossClusterIsolation(t *testing.T) {
 	srv := newTestServer(t)
 
 	connA, err := srv.Store.Enroll(types.EnrollRequest{
-		BootstrapToken: "test-bootstrap",
+		BootstrapToken: "test-enroll",
 		ClusterName:    "cluster-a",
 	})
 	if err != nil {
 		t.Fatalf("enroll A: %v", err)
 	}
 	connB, err := srv.Store.Enroll(types.EnrollRequest{
-		BootstrapToken: "test-bootstrap",
+		BootstrapToken: "test-enroll",
 		ClusterName:    "cluster-b",
 	})
 	if err != nil {

@@ -60,7 +60,7 @@ func main() {
 	agents := map[string]*agentState{}
 	var pending *types.PendingAttest
 	quotes := map[string]types.AttestResult{} // nodeID -> quote for current campaign
-	submitted := map[string]bool{}           // campaignID already pushed upstream
+	submitted := map[string]bool{}            // campaignID already pushed upstream
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
