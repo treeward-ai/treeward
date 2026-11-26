@@ -152,3 +152,15 @@ func TestRequireLocalAuth(t *testing.T) {
 		})
 	}
 }
+
+func TestConnectorListenAddrDefault(t *testing.T) {
+	t.Setenv("TREEWARD_CONNECTOR_ADDR", "")
+	if got := connectorListenAddr(); got != "127.0.0.1:8090" {
+		t.Fatalf("default connectorListenAddr() = %q, want %q", got, "127.0.0.1:8090")
+	}
+
+	t.Setenv("TREEWARD_CONNECTOR_ADDR", ":8090")
+	if got := connectorListenAddr(); got != ":8090" {
+		t.Fatalf("override connectorListenAddr() = %q, want %q", got, ":8090")
+	}
+}

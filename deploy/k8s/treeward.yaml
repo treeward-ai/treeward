@@ -254,6 +254,7 @@ spec:
                   key: token
             - name: TREEWARD_CLUSTER
               value: kind-treeward-quickstart
+            # Bind all interfaces inside the pod so kube-proxy/Service traffic reaches the connector.
             - name: TREEWARD_CONNECTOR_ADDR
               value: ":8090"
           ports:

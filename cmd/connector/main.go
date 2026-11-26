@@ -38,7 +38,7 @@ func main() {
 		log.Fatal("TREEWARD_ENROLL_TOKEN is required")
 	}
 	cluster := env("TREEWARD_CLUSTER", "kind-treeward")
-	listen := env("TREEWARD_CONNECTOR_ADDR", ":8090")
+	listen := connectorListenAddr()
 	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
 	localAuthDisabled := strings.EqualFold(os.Getenv("TREEWARD_LOCAL_AUTH"), "off")
 	if localToken == "" {
@@ -546,6 +546,10 @@ func decodeLocalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func connectorListenAddr() string {
+	return env("TREEWARD_CONNECTOR_ADDR", "127.0.0.1:8090")
 }
 
 func env(k, def string) string {
