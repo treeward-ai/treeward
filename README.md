@@ -12,11 +12,12 @@ Run the full control-plane demo locally in a single command.
 
 ### Prerequisites
 
-- [Go](https://go.dev/dl/) 1.26+
 - [Docker](https://docs.docker.com/get-docker/) (daemon running)
 - [kind](https://kind.sigs.k8s.io/docs/user/quick-start/#installation)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - `curl`
+
+*(No local Go toolchain is required on Linux — `./bin/treeward` is extracted directly from the `treeward:quickstart` container image. On non-Linux hosts such as macOS, [Go](https://go.dev/dl/) 1.26+ is used as a fallback to build `./bin/treeward`.)*
 
 ### Run it
 
@@ -29,8 +30,8 @@ make quickstart
 1. Checks prerequisites and Docker availability.
 2. Generates random `TREEWARD_BOOTSTRAP_TOKEN` and `TREEWARD_LOCAL_TOKEN` secrets into `.treeward/quickstart.env` (mode `0600`, gitignored) on first run, reusing them on subsequent runs (or honoring explicit env overrides).
 3. Creates a dedicated Kind cluster named `treeward-quickstart` (skips creation if it already exists).
-4. Builds the `treeward:quickstart` image, loads it into Kind, and builds `./bin/treeward`.
-5. Applies Kubernetes Secrets and `deploy/k8s/treeward.yaml`, then waits for `treeward-api`, `treeward-connector`, and `treeward-agent` rollouts.
+4. Builds the `treeward:quickstart` image, loads it into Kind, and extracts `./bin/treeward` from the image (falling back to `go build` on non-Linux hosts).
+5. Applies Kubernetes Secrets and `deploy/k8s/treeward.yaml` (automatically restarting workloads if secrets changed on an existing cluster), then waits for `treeward-api`, `treeward-connector`, and `treeward-agent` rollouts.
 6. Port-forwards `svc/treeward-api` to `127.0.0.1:8080` in the background (tracked via `.treeward/port-forward.pid`).
 7. Mints an operator bearer token (`TREEWARD_TOKEN`) via `POST /v1/tokens` and saves it to `.treeward/quickstart.env`.
 8. Runs the end-to-end demo (`scripts/demo.sh`) with pass/fail output per step.
@@ -81,7 +82,7 @@ Stops the background port-forward, deletes the `treeward-quickstart` Kind cluste
   make status
   make logs
   ```
-- **401 Unauthorized after changing secrets:** If you rotated `TREEWARD_BOOTSTRAP_TOKEN`, run `make teardown && make quickstart` to recreate the cluster secrets and mint a fresh operator token.
+- **401 Unauthorized after changing secrets:** Re-run `make quickstart` with the new `TREEWARD_BOOTSTRAP_TOKEN` / `TREEWARD_LOCAL_TOKEN`; quickstart detects the secret change, restarts the workloads automatically, and mints a fresh operator token.
 
 ## Pause on hard fail
 

@@ -25,10 +25,6 @@ die()  { printf '[quickstart] ERROR: %s\n' "$*" >&2; exit 1; }
 
 check_prereqs() {
   local missing=0
-  if ! command -v go >/dev/null 2>&1; then
-    printf '  missing: go       -> https://go.dev/dl/ (Go 1.26+ required)\n' >&2
-    missing=1
-  fi
   if ! command -v docker >/dev/null 2>&1; then
     printf '  missing: docker   -> https://docs.docker.com/get-docker/\n' >&2
     missing=1
@@ -139,20 +135,55 @@ ensure_cluster() {
   fi
 }
 
+install_cli() {
+  mkdir -p "$ROOT/bin"
+  local host_os host_arch image_platform
+  host_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$(uname -m)" in
+    x86_64|amd64) host_arch="amd64" ;;
+    aarch64|arm64) host_arch="arm64" ;;
+    *) host_arch="$(uname -m)" ;;
+  esac
+  image_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE" 2>/dev/null || true)"
+
+  if [[ "${host_os}/${host_arch}" == "${image_platform}" ]]; then
+    log "Extracting local treeward CLI from '${IMAGE}' (${image_platform})..."
+    local cid
+    cid="$(docker create "$IMAGE")"
+    if ! docker cp "${cid}:/app/treeward" "$ROOT/bin/treeward"; then
+      docker rm -f "$cid" >/dev/null 2>&1 || true
+      die "Failed to extract /app/treeward from '${IMAGE}'."
+    fi
+    docker rm -f "$cid" >/dev/null
+    chmod +x "$ROOT/bin/treeward"
+    return 0
+  fi
+
+  if command -v go >/dev/null 2>&1; then
+    log "Host platform (${host_os}/${host_arch}) differs from image (${image_platform:-unknown}); building local treeward CLI with go..."
+    (cd "$ROOT" && CGO_ENABLED=0 go build -o "$ROOT/bin/treeward" ./cmd/treeward)
+    return 0
+  fi
+
+  die "Host platform (${host_os}/${host_arch}) does not match container image (${image_platform:-unknown}) and 'go' is not installed to build ./bin/treeward."
+}
+
 build_and_load() {
   log "Building container image '${IMAGE}'..."
   docker build -t "$IMAGE" "$ROOT"
   log "Loading '${IMAGE}' into Kind cluster '${CLUSTER_NAME}'..."
   kind load docker-image "$IMAGE" --name "$CLUSTER_NAME"
-  log "Building local treeward CLI..."
-  mkdir -p "$ROOT/bin"
-  (cd "$ROOT" && CGO_ENABLED=0 go build -o "$ROOT/bin/treeward" ./cmd/treeward)
+  install_cli
 }
 
 deploy_manifests() {
   log "Applying namespace, secrets, and manifests to '${CONTEXT}'..."
   kubectl --context "$CONTEXT" create namespace "$NAMESPACE" --dry-run=client -o yaml \
     | kubectl --context "$CONTEXT" apply -f - >/dev/null
+
+  local prev_bootstrap_rv prev_local_rv
+  prev_bootstrap_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-bootstrap -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+  prev_local_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-local -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
 
   # Apply secrets via stdin so token values never appear in stdout or process args.
   kubectl --context "$CONTEXT" apply -f - >/dev/null <<EOF
@@ -175,7 +206,17 @@ stringData:
   token: "${LOCAL_TOKEN}"
 EOF
 
+  local new_bootstrap_rv new_local_rv
+  new_bootstrap_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-bootstrap -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+  new_local_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-local -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+
   kubectl --context "$CONTEXT" apply -f "$ROOT/deploy/k8s/treeward.yaml"
+
+  if [[ ( -n "$prev_bootstrap_rv" && "$prev_bootstrap_rv" != "$new_bootstrap_rv" ) || ( -n "$prev_local_rv" && "$prev_local_rv" != "$new_local_rv" ) ]]; then
+    log "Detected secret rotation; restarting workloads to pick up new tokens..."
+    kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout restart \
+      deploy/treeward-api deploy/treeward-connector ds/treeward-agent
+  fi
 
   log "Waiting for rollouts..."
   kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout status deploy/treeward-api --timeout=120s
