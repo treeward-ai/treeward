@@ -35,6 +35,13 @@ func main() {
 	cluster := env("TREEWARD_CLUSTER", "kind-treeward")
 	listen := env("TREEWARD_CONNECTOR_ADDR", ":8090")
 	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
+	localAuthDisabled := strings.EqualFold(os.Getenv("TREEWARD_LOCAL_AUTH"), "off")
+	if localToken == "" {
+		if !localAuthDisabled {
+			log.Fatal("TREEWARD_LOCAL_TOKEN is required (set TREEWARD_LOCAL_AUTH=off for local dev only)")
+		}
+		log.Printf("WARNING: TREEWARD_LOCAL_AUTH=off and TREEWARD_LOCAL_TOKEN is empty; local connector endpoints are unauthenticated (local dev only)")
+	}
 	interval := 5 * time.Second
 
 	creds := newCredManager(apiURL, bootstrap, cluster, enroll)
@@ -56,7 +63,7 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.HandleFunc("POST /v1/local/report", requireLocalAuth(localToken, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/local/report", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
 		var reports []types.AgentReport
 		if err := json.NewDecoder(r.Body).Decode(&reports); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -72,7 +79,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	mux.HandleFunc("GET /v1/local/desired", requireLocalAuth(localToken, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/local/desired", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, _ *http.Request) {
 		tok, _ := creds.snapshot()
 		desired, err := getDesired(apiURL, tok)
 		if err != nil {
@@ -92,7 +99,7 @@ func main() {
 		writeJSON(w, desired)
 	}))
 
-	mux.HandleFunc("GET /v1/local/attest", requireLocalAuth(localToken, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/local/attest", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		p := pending
 		mu.Unlock()
@@ -103,7 +110,7 @@ func main() {
 		writeJSON(w, p)
 	}))
 
-	mux.HandleFunc("POST /v1/local/attest", requireLocalAuth(localToken, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/local/attest", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
 		var results []types.AttestResult
 		if err := json.NewDecoder(r.Body).Decode(&results); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -353,12 +360,16 @@ func (c *credManager) reenroll(failedToken string) error {
 	return nil
 }
 
-func requireLocalAuth(expectedToken string, next http.HandlerFunc) http.HandlerFunc {
-	if expectedToken == "" {
+func requireLocalAuth(expectedToken string, authDisabled bool, next http.HandlerFunc) http.HandlerFunc {
+	if authDisabled && expectedToken == "" {
 		return next
 	}
 	expected := []byte(expectedToken)
 	return func(w http.ResponseWriter, r *http.Request) {
+		if len(expected) == 0 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
