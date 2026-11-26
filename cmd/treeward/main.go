@@ -68,17 +68,20 @@ func main() {
 
 func runToken(api string) {
 	if len(os.Args) < 3 {
-		fatal(fmt.Errorf("usage: treeward token create <name> | list | revoke <id>"))
+		fatal(fmt.Errorf("usage: treeward token create <name> [--role <viewer|operator|approver|admin>] | list | revoke <id>"))
 	}
 	switch os.Args[2] {
 	case "create":
-		name := mustArg(3, "token name required")
+		req, err := parseCreateTokenArgs(os.Args[3:])
+		if err != nil {
+			fatal(err)
+		}
 		adminBootstrap := os.Getenv("TREEWARD_ADMIN_BOOTSTRAP_TOKEN")
 		if adminBootstrap == "" {
 			fatal(fmt.Errorf("TREEWARD_ADMIN_BOOTSTRAP_TOKEN is required for 'token create'"))
 		}
 		var raw json.RawMessage
-		doRequest(http.MethodPost, api+"/v1/tokens", types.CreateTokenRequest{Name: name}, adminBootstrap, &raw)
+		doRequest(http.MethodPost, api+"/v1/tokens", req, adminBootstrap, &raw)
 		var buf bytes.Buffer
 		_ = json.Indent(&buf, raw, "", "  ")
 		fmt.Println(buf.String())
@@ -122,7 +125,8 @@ func runDemo(api string) {
 	fmt.Printf("binding id=%s status=%s\n", bind.ID, bind.Status)
 
 	fmt.Println("== approve")
-	mustPost(api+"/v1/bindings/"+bind.ID+"/approve", types.ApproveRequest{Actor: "damian"}, &bind)
+	approverToken := env("TREEWARD_APPROVER_TOKEN", os.Getenv("TREEWARD_TOKEN"))
+	doRequest(http.MethodPost, api+"/v1/bindings/"+bind.ID+"/approve", types.ApproveRequest{}, approverToken, &bind)
 	fmt.Printf("status=%s by=%s\n", bind.Status, bind.ApprovedBy)
 
 	fmt.Println("== canary (wait for agents)")
@@ -224,13 +228,14 @@ Usage:
   treeward approve|canary|promote|revert <binding-id> [actor]
   treeward attest
   treeward demo
-  treeward token create <name>
+  treeward token create <name> [--role <viewer|operator|approver|admin>]
   treeward token list
   treeward token revoke <id>
 
 Env:
   TREEWARD_API_URL               (default http://127.0.0.1:8080)
-  TREEWARD_TOKEN                 (operator bearer token for admin routes)
+  TREEWARD_TOKEN                 (operator bearer token for admin/operator routes)
+  TREEWARD_APPROVER_TOKEN        (distinct approver bearer token used by 'demo' for two-person approval)
   TREEWARD_ADMIN_BOOTSTRAP_TOKEN (admin bootstrap token for 'token create', required)
 
 Pause-on-hard-fail (binding → paused; no auto-revert; promote rejected):
@@ -377,4 +382,44 @@ func parseCreateArtifactArgs(args []string) (types.Artifact, error) {
 		}
 	}
 	return art, nil
+}
+
+func parseCreateTokenArgs(args []string) (types.CreateTokenRequest, error) {
+	var req types.CreateTokenRequest
+	nameSet := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--role" || a == "-role":
+			if i+1 >= len(args) {
+				return types.CreateTokenRequest{}, fmt.Errorf("flag %s requires a value", a)
+			}
+			i++
+			req.Role = args[i]
+		case strings.HasPrefix(a, "--role="):
+			req.Role = strings.TrimPrefix(a, "--role=")
+		case strings.HasPrefix(a, "-role="):
+			req.Role = strings.TrimPrefix(a, "-role=")
+		case strings.HasPrefix(a, "-"):
+			return types.CreateTokenRequest{}, fmt.Errorf("unknown flag: %s", a)
+		default:
+			if !nameSet {
+				req.Name = strings.TrimSpace(a)
+				nameSet = true
+			} else {
+				return types.CreateTokenRequest{}, fmt.Errorf("unexpected argument: %s", a)
+			}
+		}
+	}
+	if req.Name == "" {
+		return types.CreateTokenRequest{}, fmt.Errorf("token name required")
+	}
+	if req.Role != "" {
+		norm, err := types.NormalizeRole(req.Role)
+		if err != nil {
+			return types.CreateTokenRequest{}, err
+		}
+		req.Role = norm
+	}
+	return req, nil
 }

@@ -48,25 +48,25 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("POST /v1/agents/report", s.withConnector(s.handleAgentReport))
 
 	s.Mux.HandleFunc("POST /v1/tokens", s.withAdminBootstrap(s.handleCreateToken))
-	s.Mux.HandleFunc("GET /v1/tokens", s.withOperator(s.handleListTokens))
-	s.Mux.HandleFunc("DELETE /v1/tokens/{id}", s.withOperator(s.handleRevokeToken))
+	s.Mux.HandleFunc("GET /v1/tokens", s.withRoles(s.handleListTokens, types.RoleAdmin))
+	s.Mux.HandleFunc("DELETE /v1/tokens/{id}", s.withRoles(s.handleRevokeToken, types.RoleAdmin))
 
-	s.Mux.HandleFunc("GET /v1/nodes", s.withOperator(s.handleListNodes))
-	s.Mux.HandleFunc("POST /v1/artifacts", s.withOperator(s.handleCreateArtifact))
-	s.Mux.HandleFunc("GET /v1/artifacts", s.withOperator(s.handleListArtifacts))
-	s.Mux.HandleFunc("POST /v1/bindings", s.withOperator(s.handleCreateBinding))
-	s.Mux.HandleFunc("GET /v1/bindings", s.withOperator(s.handleListBindings))
-	s.Mux.HandleFunc("GET /v1/bindings/{id}", s.withOperator(s.handleGetBinding))
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/approve", s.withOperator(s.handleApprove))
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/canary", s.withOperator(s.handleCanary))
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/promote", s.withOperator(s.handlePromote))
-	s.Mux.HandleFunc("POST /v1/bindings/{id}/revert", s.withOperator(s.handleRevert))
-	s.Mux.HandleFunc("GET /v1/tree", s.withOperator(s.handleTree))
-	s.Mux.HandleFunc("GET /v1/audit", s.withOperator(s.handleAudit))
-	s.Mux.HandleFunc("POST /v1/attest/campaigns", s.withOperator(s.handleStartAttest))
-	s.Mux.HandleFunc("GET /v1/attest/campaigns", s.withOperator(s.handleListAttest))
+	s.Mux.HandleFunc("GET /v1/nodes", s.withRoles(s.handleListNodes, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/artifacts", s.withRoles(s.handleCreateArtifact, types.RoleOperator, types.RoleAdmin))
+	s.Mux.HandleFunc("GET /v1/artifacts", s.withRoles(s.handleListArtifacts, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/bindings", s.withRoles(s.handleCreateBinding, types.RoleOperator, types.RoleAdmin))
+	s.Mux.HandleFunc("GET /v1/bindings", s.withRoles(s.handleListBindings, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("GET /v1/bindings/{id}", s.withRoles(s.handleGetBinding, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/approve", s.withRoles(s.handleApprove, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/canary", s.withRoles(s.handleCanary, types.RoleOperator, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/promote", s.withRoles(s.handlePromote, types.RoleOperator, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/bindings/{id}/revert", s.withRoles(s.handleRevert, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("GET /v1/tree", s.withRoles(s.handleTree, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("GET /v1/audit", s.withRoles(s.handleAudit, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/attest/campaigns", s.withRoles(s.handleStartAttest, types.RoleOperator, types.RoleAdmin))
+	s.Mux.HandleFunc("GET /v1/attest/campaigns", s.withRoles(s.handleListAttest, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
 	s.Mux.HandleFunc("GET /v1/attest/active", s.withConnector(s.handleActiveAttest))
-	s.Mux.HandleFunc("GET /v1/attest/campaigns/{id}", s.withOperator(s.handleGetAttest))
+	s.Mux.HandleFunc("GET /v1/attest/campaigns/{id}", s.withRoles(s.handleGetAttest, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
 	s.Mux.HandleFunc("POST /v1/attest/campaigns/{id}/results", s.withConnector(s.handleAttestResults))
 }
 
@@ -78,7 +78,16 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 }
 
-func (s *Server) withOperator(next http.HandlerFunc) http.HandlerFunc {
+func roleAllowed(role string, allowed []string) bool {
+	for _, a := range allowed {
+		if role == a {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) withRoles(next http.HandlerFunc, allowed ...string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.AuthDisabled {
 			next(w, r)
@@ -88,6 +97,14 @@ func (s *Server) withOperator(next http.HandlerFunc) http.HandlerFunc {
 		tok, ok := s.Store.AuthenticateToken(raw)
 		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		role := tok.Role
+		if role == "" {
+			role = types.RoleAdmin
+		}
+		if !roleAllowed(role, allowed) {
+			http.Error(w, "forbidden: insufficient role", http.StatusForbidden)
 			return
 		}
 		ctx := context.WithValue(r.Context(), ctxKeyOperatorToken{}, tok)
@@ -114,8 +131,13 @@ func operatorTokenFromContext(ctx context.Context) *types.APIToken {
 }
 
 func actorFromRequest(r *http.Request, fallback string) string {
-	if tok := operatorTokenFromContext(r.Context()); tok != nil && tok.Name != "" {
-		return tok.Name
+	if tok := operatorTokenFromContext(r.Context()); tok != nil {
+		if tok.Name != "" {
+			return tok.Name
+		}
+		if tok.ID != "" {
+			return tok.ID
+		}
 	}
 	return fallback
 }
@@ -125,7 +147,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	resp, err := s.Store.CreateToken(req.Name, req.ExpiresAt)
+	resp, err := s.Store.CreateTokenWithRole(req.Name, req.Role, req.ExpiresAt)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -242,7 +264,7 @@ func (s *Server) handleCreateArtifact(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &a) {
 		return
 	}
-	writeJSON(w, http.StatusCreated, s.Store.CreateArtifact(a))
+	writeJSON(w, http.StatusCreated, s.Store.CreateArtifactBy(a, actorFromRequest(r, "api")))
 }
 
 func (s *Server) handleListArtifacts(w http.ResponseWriter, _ *http.Request) {
@@ -254,7 +276,9 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &b) {
 		return
 	}
-	out, err := s.Store.CreateBinding(b)
+	// Never trust client-supplied CreatedBy; bind to authenticated principal.
+	b.CreatedBy = ""
+	out, err := s.Store.CreateBindingBy(b, actorFromRequest(r, ""))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -282,6 +306,10 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.Store.Approve(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
+		if errors.Is(err, store.ErrSelfApproveForbidden) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

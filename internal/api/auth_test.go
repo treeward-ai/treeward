@@ -151,58 +151,284 @@ func TestHealthzOpenAndConnectorRoutesUnaffected(t *testing.T) {
 
 func TestActorDerivedFromAuthenticatedToken(t *testing.T) {
 	srv := newTestServer(t)
-	minted, err := srv.Store.CreateToken("alice-ci", nil)
+	alice, err := srv.Store.CreateTokenWithRole("alice-ci", types.RoleOperator, nil)
 	if err != nil {
-		t.Fatalf("CreateToken: %v", err)
+		t.Fatalf("CreateTokenWithRole alice: %v", err)
+	}
+	bob, err := srv.Store.CreateTokenWithRole("bob-approver", types.RoleApprover, nil)
+	if err != nil {
+		t.Fatalf("CreateTokenWithRole bob: %v", err)
 	}
 
-	// Create artifact & binding.
-	artRec := doReq(t, srv, http.MethodPost, "/v1/artifacts", minted.Token, types.Artifact{Name: "p1", Type: "bpf"})
+	// Create artifact & binding (attempting to spoof createdBy in JSON body must be ignored).
+	artRec := doReq(t, srv, http.MethodPost, "/v1/artifacts", alice.Token, types.Artifact{Name: "p1", Type: "bpf"})
 	if artRec.Code != http.StatusCreated {
 		t.Fatalf("create artifact: %d", artRec.Code)
 	}
 	var art types.Artifact
 	_ = json.Unmarshal(artRec.Body.Bytes(), &art)
 
-	bindRec := doReq(t, srv, http.MethodPost, "/v1/bindings", minted.Token, types.Binding{
+	bindRec := doReq(t, srv, http.MethodPost, "/v1/bindings", alice.Token, types.Binding{
 		ArtifactDigest: art.Digest,
 		TreeRef:        "default",
+		CreatedBy:      "spoofed-creator",
 	})
 	if bindRec.Code != http.StatusCreated {
 		t.Fatalf("create binding: %d", bindRec.Code)
 	}
 	var bind types.Binding
 	_ = json.Unmarshal(bindRec.Body.Bytes(), &bind)
+	if bind.CreatedBy != "alice-ci" {
+		t.Fatalf("CreatedBy = %q, want %q", bind.CreatedBy, "alice-ci")
+	}
 
-	// Approve with a spoofed body actor -> should record "alice-ci".
-	appRec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", minted.Token, types.ApproveRequest{Actor: "spoofed"})
+	// Approve with a spoofed body actor as bob-approver -> should record "bob-approver".
+	appRec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", bob.Token, types.ApproveRequest{Actor: "spoofed"})
 	if appRec.Code != http.StatusOK {
 		t.Fatalf("approve: %d (%s)", appRec.Code, appRec.Body.String())
 	}
 	var approved types.Binding
 	_ = json.Unmarshal(appRec.Body.Bytes(), &approved)
-	if approved.ApprovedBy != "alice-ci" {
-		t.Fatalf("ApprovedBy = %q, want %q", approved.ApprovedBy, "alice-ci")
+	if approved.ApprovedBy != "bob-approver" {
+		t.Fatalf("ApprovedBy = %q, want %q", approved.ApprovedBy, "bob-approver")
 	}
 
 	// Start attest campaign -> audit actor should be "alice-ci".
-	attRec := doReq(t, srv, http.MethodPost, "/v1/attest/campaigns", minted.Token, map[string]any{})
+	attRec := doReq(t, srv, http.MethodPost, "/v1/attest/campaigns", alice.Token, map[string]any{})
 	if attRec.Code != http.StatusCreated {
 		t.Fatalf("start attest: %d", attRec.Code)
 	}
 
 	audit := srv.Store.ListAudit()
-	foundApprove, foundAttest := false, false
+	foundArtifact, foundBinding, foundApprove, foundAttest := false, false, false, false
 	for _, ev := range audit {
-		if ev.Action == "approve" && ev.Actor == "alice-ci" {
+		if ev.Action == "artifact.create" && ev.Actor == "alice-ci" {
+			foundArtifact = true
+		}
+		if ev.Action == "binding.create" && ev.Actor == "alice-ci" {
+			foundBinding = true
+		}
+		if ev.Action == "approve" && ev.Actor == "bob-approver" {
 			foundApprove = true
 		}
 		if ev.Action == "attest.start" && ev.Actor == "alice-ci" {
 			foundAttest = true
 		}
 	}
-	if !foundApprove || !foundAttest {
-		t.Fatalf("expected audit events with actor=alice-ci (approve=%v attest=%v): %+v", foundApprove, foundAttest, audit)
+	if !foundArtifact || !foundBinding || !foundApprove || !foundAttest {
+		t.Fatalf("expected audit events bound to authenticated principals (art=%v bind=%v approve=%v attest=%v): %+v",
+			foundArtifact, foundBinding, foundApprove, foundAttest, audit)
+	}
+}
+
+func TestRBACRoleMatrix(t *testing.T) {
+	srv := newTestServer(t)
+
+	// Mint tokens via HTTP API to also exercise role validation and default role.
+	if rec := doReq(t, srv, http.MethodPost, "/v1/tokens", "test-admin-bootstrap", types.CreateTokenRequest{
+		Name: "bad-role",
+		Role: "root",
+	}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /v1/tokens invalid role: got %d, want 400", rec.Code)
+	}
+
+	mint := func(name, role string) types.CreateTokenResponse {
+		t.Helper()
+		rec := doReq(t, srv, http.MethodPost, "/v1/tokens", "test-admin-bootstrap", types.CreateTokenRequest{
+			Name: name,
+			Role: role,
+		})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("mint %s (%s): got %d (%s)", name, role, rec.Code, rec.Body.String())
+		}
+		var out types.CreateTokenResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode minted %s: %v", name, err)
+		}
+		return out
+	}
+
+	viewer := mint("v-user", types.RoleViewer)
+	operator := mint("o-user", types.RoleOperator)
+	approver := mint("a-user", types.RoleApprover)
+	admin := mint("adm-user", "") // omitted -> defaults to admin
+	if admin.Role != types.RoleAdmin {
+		t.Fatalf("omitted role = %q, want admin", admin.Role)
+	}
+	disposable := mint("temp-viewer", types.RoleViewer)
+
+	// Seed an artifact, binding, and campaign via operator so read & transition routes have IDs.
+	artRec := doReq(t, srv, http.MethodPost, "/v1/artifacts", operator.Token, types.Artifact{Name: "shield", Type: "bpf"})
+	if artRec.Code != http.StatusCreated {
+		t.Fatalf("operator create artifact: got %d", artRec.Code)
+	}
+	var art types.Artifact
+	_ = json.Unmarshal(artRec.Body.Bytes(), &art)
+
+	bindRec := doReq(t, srv, http.MethodPost, "/v1/bindings", operator.Token, types.Binding{ArtifactDigest: art.Digest})
+	if bindRec.Code != http.StatusCreated {
+		t.Fatalf("operator create binding: got %d", bindRec.Code)
+	}
+	var bind types.Binding
+	_ = json.Unmarshal(bindRec.Body.Bytes(), &bind)
+
+	campRec := doReq(t, srv, http.MethodPost, "/v1/attest/campaigns", operator.Token, map[string]any{})
+	if campRec.Code != http.StatusCreated {
+		t.Fatalf("operator start attest: got %d", campRec.Code)
+	}
+	var camp types.AttestCampaign
+	_ = json.Unmarshal(campRec.Body.Bytes(), &camp)
+
+	// 1. Read-only routes: all 4 roles allowed.
+	readRoutes := []string{
+		"/v1/nodes",
+		"/v1/artifacts",
+		"/v1/bindings",
+		"/v1/bindings/" + bind.ID,
+		"/v1/tree",
+		"/v1/audit",
+		"/v1/attest/campaigns",
+		"/v1/attest/campaigns/" + camp.ID,
+	}
+	for _, tok := range []types.CreateTokenResponse{viewer, operator, approver, admin} {
+		for _, path := range readRoutes {
+			if rec := doReq(t, srv, http.MethodGet, path, tok.Token, nil); rec.Code != http.StatusOK {
+				t.Errorf("role=%s GET %s: got %d, want 200", tok.Role, path, rec.Code)
+			}
+		}
+	}
+
+	// 2. Viewer is denied (403) on all mutating & token-admin routes.
+	viewerDenied := []struct {
+		method, path string
+		body         any
+	}{
+		{http.MethodPost, "/v1/artifacts", types.Artifact{Name: "x", Type: "bpf"}},
+		{http.MethodPost, "/v1/bindings", types.Binding{ArtifactDigest: art.Digest}},
+		{http.MethodPost, "/v1/bindings/" + bind.ID + "/approve", types.ApproveRequest{}},
+		{http.MethodPost, "/v1/bindings/" + bind.ID + "/canary", types.ApproveRequest{}},
+		{http.MethodPost, "/v1/bindings/" + bind.ID + "/promote", types.ApproveRequest{}},
+		{http.MethodPost, "/v1/bindings/" + bind.ID + "/revert", types.ApproveRequest{}},
+		{http.MethodPost, "/v1/attest/campaigns", map[string]any{}},
+		{http.MethodGet, "/v1/tokens", nil},
+		{http.MethodDelete, "/v1/tokens/" + disposable.ID, nil},
+	}
+	for _, tc := range viewerDenied {
+		if rec := doReq(t, srv, tc.method, tc.path, viewer.Token, tc.body); rec.Code != http.StatusForbidden {
+			t.Errorf("viewer %s %s: got %d, want 403", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	// 3. Operator cannot approve or manage tokens (403).
+	for _, tc := range []struct {
+		method, path string
+		body         any
+	}{
+		{http.MethodPost, "/v1/bindings/" + bind.ID + "/approve", types.ApproveRequest{}},
+		{http.MethodGet, "/v1/tokens", nil},
+		{http.MethodDelete, "/v1/tokens/" + disposable.ID, nil},
+	} {
+		if rec := doReq(t, srv, tc.method, tc.path, operator.Token, tc.body); rec.Code != http.StatusForbidden {
+			t.Errorf("operator %s %s: got %d, want 403", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	// 4. Approver cannot create artifacts/bindings, canary, promote, attest, or manage tokens (403).
+	for _, tc := range []struct {
+		method, path string
+		body         any
+	}{
+		{http.MethodPost, "/v1/artifacts", types.Artifact{Name: "y", Type: "bpf"}},
+		{http.MethodPost, "/v1/bindings", types.Binding{ArtifactDigest: art.Digest}},
+		{http.MethodPost, "/v1/bindings/" + bind.ID + "/canary", types.ApproveRequest{}},
+		{http.MethodPost, "/v1/bindings/" + bind.ID + "/promote", types.ApproveRequest{}},
+		{http.MethodPost, "/v1/attest/campaigns", map[string]any{}},
+		{http.MethodGet, "/v1/tokens", nil},
+		{http.MethodDelete, "/v1/tokens/" + disposable.ID, nil},
+	} {
+		if rec := doReq(t, srv, tc.method, tc.path, approver.Token, tc.body); rec.Code != http.StatusForbidden {
+			t.Errorf("approver %s %s: got %d, want 403", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	// 5. Full separated workflow: approver approves -> operator canaries & promotes -> approver reverts.
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", approver.Token, types.ApproveRequest{}); rec.Code != http.StatusOK {
+		t.Fatalf("approver approve: got %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/canary", operator.Token, types.ApproveRequest{}); rec.Code != http.StatusOK {
+		t.Fatalf("operator canary: got %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/promote", operator.Token, types.ApproveRequest{}); rec.Code != http.StatusOK {
+		t.Fatalf("operator promote: got %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/revert", approver.Token, types.ApproveRequest{}); rec.Code != http.StatusOK {
+		t.Fatalf("approver revert: got %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+
+	// 6. Admin can list and revoke tokens.
+	listRec := doReq(t, srv, http.MethodGet, "/v1/tokens", admin.Token, nil)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("admin GET /v1/tokens: got %d, want 200", listRec.Code)
+	}
+	var listed []types.APIToken
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode token list: %v", err)
+	}
+	if len(listed) < 5 {
+		t.Fatalf("expected >=5 tokens, got %d", len(listed))
+	}
+	if rec := doReq(t, srv, http.MethodDelete, "/v1/tokens/"+disposable.ID, admin.Token, nil); rec.Code != http.StatusOK {
+		t.Fatalf("admin DELETE /v1/tokens: got %d, want 200", rec.Code)
+	}
+}
+
+func TestSeparationOfDutiesAndSelfApproveOptIn(t *testing.T) {
+	srv := newTestServer(t)
+
+	adminAlice, err := srv.Store.CreateTokenWithRole("alice-admin", types.RoleAdmin, nil)
+	if err != nil {
+		t.Fatalf("CreateTokenWithRole alice: %v", err)
+	}
+	approverBob, err := srv.Store.CreateTokenWithRole("bob-approver", types.RoleApprover, nil)
+	if err != nil {
+		t.Fatalf("CreateTokenWithRole bob: %v", err)
+	}
+
+	artRec := doReq(t, srv, http.MethodPost, "/v1/artifacts", adminAlice.Token, types.Artifact{Name: "p-sod", Type: "bpf"})
+	if artRec.Code != http.StatusCreated {
+		t.Fatalf("create artifact: got %d", artRec.Code)
+	}
+	var art types.Artifact
+	_ = json.Unmarshal(artRec.Body.Bytes(), &art)
+
+	bindRec := doReq(t, srv, http.MethodPost, "/v1/bindings", adminAlice.Token, types.Binding{ArtifactDigest: art.Digest})
+	if bindRec.Code != http.StatusCreated {
+		t.Fatalf("create binding: got %d", bindRec.Code)
+	}
+	var bind types.Binding
+	_ = json.Unmarshal(bindRec.Body.Bytes(), &bind)
+
+	// Even an admin cannot self-approve by default (fail-closed two-person rule).
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", adminAlice.Token, types.ApproveRequest{}); rec.Code != http.StatusForbidden {
+		t.Fatalf("self-approve by admin creator: got %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+
+	// Distinct approver succeeds.
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", approverBob.Token, types.ApproveRequest{}); rec.Code != http.StatusOK {
+		t.Fatalf("approve by distinct approver: got %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+
+	// Explicit opt-in (TREEWARD_ALLOW_SELF_APPROVE=true) permits self-approval.
+	srv.Store.AllowSelfApprove = true
+	bind2Rec := doReq(t, srv, http.MethodPost, "/v1/bindings", adminAlice.Token, types.Binding{ArtifactDigest: art.Digest})
+	if bind2Rec.Code != http.StatusCreated {
+		t.Fatalf("create binding 2: got %d", bind2Rec.Code)
+	}
+	var bind2 types.Binding
+	_ = json.Unmarshal(bind2Rec.Body.Bytes(), &bind2)
+
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind2.ID+"/approve", adminAlice.Token, types.ApproveRequest{}); rec.Code != http.StatusOK {
+		t.Fatalf("self-approve with AllowSelfApprove=true: got %d (%s), want 200", rec.Code, rec.Body.String())
 	}
 }
 

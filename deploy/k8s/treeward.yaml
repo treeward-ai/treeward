@@ -161,6 +161,9 @@ spec:
               value: /var/treeward/keys
             - name: TREEWARD_DATA_DIR
               value: /var/treeward/data
+            # Two-person separation of duties is enforced by default (binding creator cannot
+            # approve their own binding). `make quickstart` mints distinct operator and approver
+            # tokens; set TREEWARD_ALLOW_SELF_APPROVE=true only for single-operator dev setups.
           ports:
             - containerPort: 8080
           volumeMounts:

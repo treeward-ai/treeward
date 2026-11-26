@@ -33,16 +33,16 @@ make quickstart
 4. Builds the `treeward:quickstart` image, loads it into Kind, and extracts `./bin/treeward` from the image (falling back to `go build` on non-Linux hosts).
 5. Applies Kubernetes Secrets and `deploy/k8s/treeward.yaml` (automatically restarting workloads if secrets changed on an existing cluster), then waits for `treeward-api`, `treeward-connector`, and `treeward-agent` rollouts.
 6. Port-forwards `svc/treeward-api` to `127.0.0.1:8080` in the background (tracked via `.treeward/port-forward.pid`).
-7. Mints an operator bearer token (`TREEWARD_TOKEN`) via `POST /v1/tokens` and saves it to `.treeward/quickstart.env`.
+7. Mints distinct operator (`TREEWARD_TOKEN`, role `admin`) and approver (`TREEWARD_APPROVER_TOKEN`, role `approver`) bearer tokens via `POST /v1/tokens` and saves them to `.treeward/quickstart.env`.
 8. Runs the end-to-end demo (`scripts/demo.sh`) with pass/fail output per step.
 
 ### What the demo shows
 
-`make demo` (run automatically at the end of `make quickstart`) authenticates with `TREEWARD_TOKEN` and verifies the full control-plane lifecycle against the stub fleet:
+`make demo` (run automatically at the end of `make quickstart`) authenticates with `TREEWARD_TOKEN` (and `TREEWARD_APPROVER_TOKEN` for the approval step) and verifies the full control-plane lifecycle against the stub fleet:
 
 - **Health & inventory:** confirms the API is reachable and 3 stub nodes (`*-canary`, `*-n1`, `*-n2`) are reporting through the connector.
-- **Artifact & binding:** registers a demo artifact (SHA-256 digest) and creates a `draft` binding.
-- **Approve:** approves the binding (audit actor derived from the authenticated operator token).
+- **Artifact & binding:** registers a demo artifact (SHA-256 digest) and creates a `draft` binding (recording `createdBy` from the operator token).
+- **Approve:** approves the binding using the distinct approver token (enforcing two-person separation of duties; audit actor derived from the authenticated token).
 - **Canary:** rolls out to the `treeward.ai/rollout=canary` node only and verifies non-canary nodes remain untouched.
 - **Promote:** promotes the binding fleet-wide and verifies all nodes load the digest.
 - **Attest:** runs an attestation campaign and verifies stub quotes pass on all nodes.
@@ -115,4 +115,12 @@ Quickstart runs with `TREEWARD_RUNTIME=stub` (no kernel enforcement). Running wi
 See [`SECURITY_MODEL.md`](SECURITY_MODEL.md) for the threat model, signed tree chain verification, and attestation trust boundaries.
 
 - **Split bootstrap & local tokens:** `api` requires distinct `TREEWARD_ENROLL_TOKEN` (connector enrollment) and `TREEWARD_ADMIN_BOOTSTRAP_TOKEN` (operator token minting). `connector` protects `/v1/local/*` with `TREEWARD_LOCAL_TOKEN` and fails closed if unset; set `TREEWARD_LOCAL_AUTH=off` only for local dev.
+- **RBAC & two-person approval:** Operator tokens support `--role <viewer|operator|approver|admin>` (default `admin` if omitted):
+  ```bash
+  ./bin/treeward token create alice --role operator
+  ./bin/treeward token create bob --role approver
+  ./bin/treeward token create audit-ro --role viewer
+  ./bin/treeward token list
+  ```
+  Actor identities on bindings and audit events are bound to the authenticated token. By default, the principal who created a binding cannot approve it (`403 Forbidden`); set `TREEWARD_ALLOW_SELF_APPROVE=true` on `api` only for single-operator dev/demo setups.
 - **TLS 1.3:** Set both `TREEWARD_TLS_CERT` and `TREEWARD_TLS_KEY` on `api` or `connector` to serve HTTPS with TLS 1.3 minimum.

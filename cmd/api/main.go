@@ -57,6 +57,10 @@ func main() {
 		srv.AuthDisabled = true
 		log.Printf("WARNING: TREEWARD_AUTH=off — admin API authentication is DISABLED (local development only)")
 	}
+	if envTrue(os.Getenv("TREEWARD_ALLOW_SELF_APPROVE")) {
+		st.AllowSelfApprove = true
+		log.Printf("WARNING: TREEWARD_ALLOW_SELF_APPROVE=true — two-person approval separation of duties is DISABLED (dev/demo only)")
+	}
 	if *shirudoBin != "" {
 		cfg := api.ShirudoVerifierConfigFromEnv()
 		cfg.Bin = *shirudoBin
@@ -96,4 +100,13 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envTrue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
 }

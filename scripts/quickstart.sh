@@ -18,6 +18,7 @@ CALLER_ENROLL="${TREEWARD_ENROLL_TOKEN:-}"
 CALLER_ADMIN_BOOTSTRAP="${TREEWARD_ADMIN_BOOTSTRAP_TOKEN:-}"
 CALLER_LOCAL="${TREEWARD_LOCAL_TOKEN:-}"
 CALLER_TOKEN="${TREEWARD_TOKEN:-}"
+CALLER_APPROVER_TOKEN="${TREEWARD_APPROVER_TOKEN:-}"
 CALLER_API_PORT="${TREEWARD_API_PORT:-}"
 
 log()  { printf '[quickstart] %s\n' "$*"; }
@@ -73,6 +74,7 @@ TREEWARD_ENROLL_TOKEN=${ENROLL_TOKEN}
 TREEWARD_ADMIN_BOOTSTRAP_TOKEN=${ADMIN_BOOTSTRAP_TOKEN}
 TREEWARD_LOCAL_TOKEN=${LOCAL_TOKEN}
 TREEWARD_TOKEN=${OPERATOR_TOKEN}
+TREEWARD_APPROVER_TOKEN=${APPROVER_TOKEN}
 EOF
   chmod 600 "$tmp_file"
   mv -f "$tmp_file" "$ENV_FILE"
@@ -83,7 +85,7 @@ load_or_init_secrets() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
-  local saved_enroll="" saved_admin_bootstrap="" saved_local="" saved_token="" saved_port=""
+  local saved_enroll="" saved_admin_bootstrap="" saved_local="" saved_token="" saved_approver_token="" saved_port=""
   if [[ -f "$ENV_FILE" ]]; then
     chmod 600 "$ENV_FILE"
     # shellcheck disable=SC1090
@@ -92,6 +94,7 @@ load_or_init_secrets() {
     saved_admin_bootstrap="${TREEWARD_ADMIN_BOOTSTRAP_TOKEN:-}"
     saved_local="${TREEWARD_LOCAL_TOKEN:-}"
     saved_token="${TREEWARD_TOKEN:-}"
+    saved_approver_token="${TREEWARD_APPROVER_TOKEN:-}"
     saved_port="${TREEWARD_API_PORT:-}"
   fi
 
@@ -132,6 +135,14 @@ load_or_init_secrets() {
     OPERATOR_TOKEN="$saved_token"
   else
     OPERATOR_TOKEN=""
+  fi
+
+  if [[ -n "$CALLER_APPROVER_TOKEN" ]]; then
+    APPROVER_TOKEN="$CALLER_APPROVER_TOKEN"
+  elif [[ -n "$saved_approver_token" ]]; then
+    APPROVER_TOKEN="$saved_approver_token"
+  else
+    APPROVER_TOKEN=""
   fi
 
   write_env_file
@@ -284,45 +295,50 @@ start_port_forward() {
   die "Timed out waiting for API healthz via port-forward at ${API_URL}."
 }
 
-mint_operator_token() {
-  if [[ -n "$OPERATOR_TOKEN" ]]; then
+mint_token_with_role() {
+  local name="$1" role="$2" current="$3"
+  if [[ -n "$current" ]]; then
     local code
     code="$(curl -sS -o /dev/null -w '%{http_code}' \
-      -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
+      -H "Authorization: Bearer ${current}" \
       "${API_URL}/v1/nodes" || true)"
     if [[ "$code" == "200" ]]; then
-      log "Reusing valid operator token from .treeward/quickstart.env."
-      write_env_file
+      printf '%s' "$current"
       return 0
     fi
-    log "Saved operator token is no longer valid (HTTP ${code}); minting a fresh token..."
+    log "Saved ${name} token is no longer valid (HTTP ${code}); minting a fresh token..." >&2
   fi
 
-  log "Minting operator token via API..."
-  local resp_file http_code
+  log "Minting ${name} token (role=${role}) via API..." >&2
+  local resp_file http_code minted
   resp_file="$(mktemp)"
   chmod 600 "$resp_file"
   http_code="$(curl -sS -o "$resp_file" -w '%{http_code}' \
     -X POST \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${ADMIN_BOOTSTRAP_TOKEN}" \
-    -d '{"name":"quickstart-operator"}' \
+    -d "{\"name\":\"${name}\",\"role\":\"${role}\"}" \
     "${API_URL}/v1/tokens" || true)"
 
   if [[ "$http_code" != "201" ]]; then
     rm -f "$resp_file"
-    die "Failed to mint operator token (HTTP ${http_code}). Ensure Secret/treeward-admin-bootstrap matches TREEWARD_ADMIN_BOOTSTRAP_TOKEN."
+    die "Failed to mint ${name} token (HTTP ${http_code}). Ensure Secret/treeward-admin-bootstrap matches TREEWARD_ADMIN_BOOTSTRAP_TOKEN."
   fi
 
-  OPERATOR_TOKEN="$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$resp_file" | head -n1)"
+  minted="$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$resp_file" | head -n1)"
   rm -f "$resp_file"
 
-  if [[ -z "$OPERATOR_TOKEN" ]]; then
-    die "API returned HTTP 201 for /v1/tokens but token field could not be parsed."
+  if [[ -z "$minted" ]]; then
+    die "API returned HTTP 201 for /v1/tokens (${name}) but token field could not be parsed."
   fi
+  printf '%s' "$minted"
+}
 
+mint_operator_token() {
+  OPERATOR_TOKEN="$(mint_token_with_role "quickstart-operator" "admin" "$OPERATOR_TOKEN")"
+  APPROVER_TOKEN="$(mint_token_with_role "quickstart-approver" "approver" "$APPROVER_TOKEN")"
   write_env_file
-  log "Operator token saved to .treeward/quickstart.env (mode 0600)."
+  log "Operator and approver tokens saved to .treeward/quickstart.env (mode 0600)."
 }
 
 print_next_steps() {

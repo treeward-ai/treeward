@@ -1,11 +1,37 @@
 package types
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 const (
 	LabelRollout  = "treeward.ai/rollout"
 	RolloutCanary = "canary"
 )
+
+const (
+	RoleViewer   = "viewer"
+	RoleOperator = "operator"
+	RoleApprover = "approver"
+	RoleAdmin    = "admin"
+)
+
+// NormalizeRole validates and normalizes a token role.
+// An empty role defaults to RoleAdmin for backwards compatibility.
+func NormalizeRole(role string) (string, error) {
+	r := strings.ToLower(strings.TrimSpace(role))
+	if r == "" {
+		return RoleAdmin, nil
+	}
+	switch r {
+	case RoleViewer, RoleOperator, RoleApprover, RoleAdmin:
+		return r, nil
+	default:
+		return "", fmt.Errorf("invalid role %q (expected viewer, operator, approver, or admin)", role)
+	}
+}
 
 type Node struct {
 	ID           string            `json:"id"`
@@ -37,6 +63,7 @@ type Binding struct {
 	Selector       Selector  `json:"selector"`
 	TreeRef        string    `json:"treeRef"`
 	Status         string    `json:"status"` // draft|approved|canary|promoted|reverted|paused
+	CreatedBy      string    `json:"createdBy,omitempty"`
 	ApprovedBy     string    `json:"approvedBy,omitempty"`
 	ApprovedAt     time.Time `json:"approvedAt,omitempty"`
 	CreatedAt      time.Time `json:"createdAt"`
@@ -129,6 +156,7 @@ type AgentReport struct {
 type APIToken struct {
 	ID        string     `json:"id"`
 	Name      string     `json:"name"`
+	Role      string     `json:"role"`
 	CreatedAt time.Time  `json:"createdAt"`
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 	Revoked   bool       `json:"revoked"`
@@ -136,6 +164,7 @@ type APIToken struct {
 
 type CreateTokenRequest struct {
 	Name      string     `json:"name"`
+	Role      string     `json:"role,omitempty"`
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }
 
