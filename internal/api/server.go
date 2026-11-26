@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 )
 
 type ctxKeyOperatorToken struct{}
+type ctxKeyConnector struct{}
 
 type Server struct {
 	Store        *store.Store
@@ -143,17 +145,21 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, tok)
 }
 
+func connectorFromContext(ctx context.Context) *types.Connector {
+	c, _ := ctx.Value(ctxKeyConnector{}).(*types.Connector)
+	return c
+}
+
 func (s *Server) withConnector(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if tok == "" {
-			tok = r.Header.Get("X-Treeward-Token")
-		}
-		if _, ok := s.Store.LookupConnector(tok); !ok {
+		tok := bearerToken(r)
+		conn, ok := s.Store.LookupConnector(tok)
+		if !ok {
 			http.Error(w, "unauthorized connector", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
+		ctx := context.WithValue(r.Context(), ctxKeyConnector{}, conn)
+		next(w, r.WithContext(ctx))
 	}
 }
 
@@ -172,30 +178,59 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
+	conn := connectorFromContext(r.Context())
+	if conn == nil {
+		http.Error(w, "unauthorized connector", http.StatusUnauthorized)
+		return
+	}
 	var req types.InventoryUpsert
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.Store.UpsertInventory(req.Nodes, req.ClusterID)
+	if req.ClusterID != "" && req.ClusterID != conn.ClusterID {
+		http.Error(w, "cluster mismatch", http.StatusForbidden)
+		return
+	}
+	if err := s.Store.UpsertInventoryForCluster(req.Nodes, conn.ClusterID); err != nil {
+		if errors.Is(err, store.ErrClusterForbidden) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"upserted": len(req.Nodes)})
 }
 
-func (s *Server) handleDesired(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.Store.Desired())
+func (s *Server) handleDesired(w http.ResponseWriter, r *http.Request) {
+	conn := connectorFromContext(r.Context())
+	if conn == nil {
+		http.Error(w, "unauthorized connector", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Store.DesiredForCluster(conn.ClusterID))
 }
 
 func (s *Server) handleAgentReport(w http.ResponseWriter, r *http.Request) {
+	conn := connectorFromContext(r.Context())
+	if conn == nil {
+		http.Error(w, "unauthorized connector", http.StatusUnauthorized)
+		return
+	}
 	var reports []types.AgentReport
 	if err := json.NewDecoder(r.Body).Decode(&reports); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	cluster := ""
-	if len(reports) > 0 {
-		cluster = reports[0].Node.ClusterID
+	if err := s.Store.ProcessAgentReportsForCluster(reports, conn.ClusterID); err != nil {
+		if errors.Is(err, store.ErrClusterForbidden) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	s.Store.ProcessAgentReports(reports, cluster)
 	writeJSON(w, http.StatusOK, map[string]any{"reported": len(reports)})
 }
 
@@ -322,9 +357,22 @@ func (s *Server) handleGetAttest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAttestResults(w http.ResponseWriter, r *http.Request) {
+	conn := connectorFromContext(r.Context())
+	if conn == nil {
+		http.Error(w, "unauthorized connector", http.StatusUnauthorized)
+		return
+	}
 	var results []types.AttestResult
 	if err := json.NewDecoder(r.Body).Decode(&results); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	nodeIDs := make([]string, len(results))
+	for i := range results {
+		nodeIDs[i] = results[i].NodeID
+	}
+	if err := s.Store.ValidateNodesInCluster(nodeIDs, conn.ClusterID); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 	campaignID := r.PathValue("id")
@@ -335,8 +383,12 @@ func (s *Server) handleAttestResults(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	c, err := s.Store.SubmitAttest(campaignID, results)
+	c, err := s.Store.SubmitAttestForCluster(campaignID, conn.ClusterID, results)
 	if err != nil {
+		if errors.Is(err, store.ErrClusterForbidden) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

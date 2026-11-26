@@ -104,16 +104,30 @@ func TestRequireLocalAuth(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}
 
-	// Unset token preserves local dev behavior.
-	hOpen := requireLocalAuth("", okHandler)
+	// Empty token with authDisabled=false must fail closed (401).
+	hFailClosed := requireLocalAuth("", false, okHandler)
+	for _, hdr := range []string{"", "Bearer ", "Bearer anything"} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/local/desired", nil)
+		if hdr != "" {
+			req.Header.Set("Authorization", hdr)
+		}
+		rr := httptest.NewRecorder()
+		hFailClosed.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("fail-closed with header %q: got %d, want 401", hdr, rr.Code)
+		}
+	}
+
+	// Empty token with explicit authDisabled=true preserves local dev opt-out.
+	hOpen := requireLocalAuth("", true, okHandler)
 	rr := httptest.NewRecorder()
 	hOpen.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/local/desired", nil))
 	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 when token unset, got %d", rr.Code)
+		t.Fatalf("expected 200 when authDisabled=true and token empty, got %d", rr.Code)
 	}
 
-	// Configured token enforces Bearer auth.
-	hProtected := requireLocalAuth("super-secret", okHandler)
+	// Configured token enforces Bearer auth regardless of authDisabled.
+	hProtected := requireLocalAuth("super-secret", false, okHandler)
 
 	for _, tc := range []struct {
 		name   string

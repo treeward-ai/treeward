@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -15,6 +16,10 @@ import (
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
+// ErrClusterForbidden is returned when a connector attempts to act on a node
+// or cluster outside its own enrolled cluster.
+var ErrClusterForbidden = errors.New("forbidden: cross-cluster access denied")
+
 type Store struct {
 	mu sync.RWMutex
 
@@ -23,7 +28,7 @@ type Store struct {
 	Signer              signer.Signer
 	db                  *sql.DB
 
-	Connectors map[string]*types.Connector // by token
+	Connectors map[string]*types.Connector // by connector ID
 	Nodes      map[string]*types.Node
 	Artifacts  map[string]*types.Artifact // by id
 	Bindings   map[string]*types.Binding
@@ -50,7 +55,9 @@ func New(enrollToken, adminBootstrapToken string, s signer.Signer) *Store {
 
 func id(prefix string) string {
 	var b [8]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
 	return prefix + "-" + hex.EncodeToString(b[:])
 }
 
@@ -63,14 +70,18 @@ func (s *Store) Enroll(req types.EnrollRequest) (*types.EnrollResponse, error) {
 	if req.ClusterName == "" {
 		req.ClusterName = "default"
 	}
-	tok := id("ctok")
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return nil, fmt.Errorf("generate connector token: %w", err)
+	}
+	tok := "ctok_" + hex.EncodeToString(raw[:])
 	c := &types.Connector{
 		ID:        id("conn"),
 		ClusterID: req.ClusterName,
-		Token:     tok,
+		TokenHash: hashToken(tok),
 		Enrolled:  time.Now().UTC(),
 	}
-	s.Connectors[tok] = c
+	s.Connectors[c.ID] = c
 	s.auditLocked("enroll", "connector", "", "", "cluster="+c.ClusterID)
 	s.persistLocked()
 	return &types.EnrollResponse{
@@ -80,11 +91,20 @@ func (s *Store) Enroll(req types.EnrollRequest) (*types.EnrollResponse, error) {
 	}, nil
 }
 
-func (s *Store) LookupConnector(token string) (*types.Connector, bool) {
+func (s *Store) LookupConnector(rawToken string) (*types.Connector, bool) {
+	if rawToken == "" {
+		return nil, false
+	}
+	wantHash := []byte(hashToken(rawToken))
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	c, ok := s.Connectors[token]
-	return c, ok
+	for _, c := range s.Connectors {
+		if c.TokenHash != "" && subtle.ConstantTimeCompare([]byte(c.TokenHash), wantHash) == 1 {
+			cp := *c
+			return &cp, true
+		}
+	}
+	return nil, false
 }
 
 func (s *Store) UpsertInventory(nodes []types.Node, clusterID string) {
@@ -94,28 +114,82 @@ func (s *Store) UpsertInventory(nodes []types.Node, clusterID string) {
 	s.persistLocked()
 }
 
+// UpsertInventoryForCluster validates that none of the nodes claim or collide
+// with a different cluster, then upserts them under clusterID.
+func (s *Store) UpsertInventoryForCluster(nodes []types.Node, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range nodes {
+		if n.ClusterID != "" && n.ClusterID != clusterID {
+			return ErrClusterForbidden
+		}
+		if existing, ok := s.Nodes[n.ID]; ok && existing.ClusterID != "" && existing.ClusterID != clusterID {
+			return ErrClusterForbidden
+		}
+	}
+	s.upsertInventoryLocked(nodes, clusterID)
+	s.persistLocked()
+	return nil
+}
+
 // ProcessAgentReports upserts inventory from agent reports and pauses canary
 // bindings on hard load failures (errors mentioning the binding digest).
 func (s *Store) ProcessAgentReports(reports []types.AgentReport, clusterID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	nodes := make([]types.Node, 0, len(reports))
+	s.processAgentReportsLocked(reports, clusterID)
+	s.persistLocked()
+}
+
+// ProcessAgentReportsForCluster enforces cluster ownership on all reported
+// nodes before upserting and evaluating load errors.
+func (s *Store) ProcessAgentReportsForCluster(reports []types.AgentReport, clusterID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, rep := range reports {
+		if rep.Node.ClusterID != "" && rep.Node.ClusterID != clusterID {
+			return ErrClusterForbidden
+		}
+		if existing, ok := s.Nodes[rep.Node.ID]; ok && existing.ClusterID != "" && existing.ClusterID != clusterID {
+			return ErrClusterForbidden
+		}
+	}
+	s.processAgentReportsLocked(reports, clusterID)
+	s.persistLocked()
+	return nil
+}
+
+func (s *Store) processAgentReportsLocked(reports []types.AgentReport, clusterID string) {
+	nodes := make([]types.Node, 0, len(reports))
+	accepted := make([]types.AgentReport, 0, len(reports))
+	for _, rep := range reports {
+		if existing, ok := s.Nodes[rep.Node.ID]; ok && existing.ClusterID != "" && existing.ClusterID != clusterID {
+			continue
+		}
 		n := rep.Node
 		n.Loaded = rep.Loaded
 		nodes = append(nodes, n)
+		accepted = append(accepted, rep)
 	}
 	s.upsertInventoryLocked(nodes, clusterID)
-	for _, rep := range reports {
+	for _, rep := range accepted {
 		s.pauseOnLoadErrorsLocked(rep)
 	}
-	s.persistLocked()
 }
 
 func (s *Store) upsertInventoryLocked(nodes []types.Node, clusterID string) {
 	now := time.Now().UTC()
 	for i := range nodes {
 		n := nodes[i]
+		if existing, ok := s.Nodes[n.ID]; ok {
+			if existing.ClusterID != "" && existing.ClusterID != clusterID {
+				continue
+			}
+			// Preserve attest status unless reporter sets it.
+			if n.AttestStatus == "" {
+				n.AttestStatus = existing.AttestStatus
+			}
+		}
 		n.ClusterID = clusterID
 		n.LastSeen = now
 		if n.Labels == nil {
@@ -123,12 +197,6 @@ func (s *Store) upsertInventoryLocked(nodes []types.Node, clusterID string) {
 		}
 		if n.Loaded == nil {
 			n.Loaded = []string{}
-		}
-		if existing, ok := s.Nodes[n.ID]; ok {
-			// Preserve attest status unless reporter sets it.
-			if n.AttestStatus == "" {
-				n.AttestStatus = existing.AttestStatus
-			}
 		}
 		cp := n
 		s.Nodes[n.ID] = &cp
@@ -347,16 +415,32 @@ func (s *Store) TreeOps() []types.TreeOp {
 func (s *Store) Desired() types.DesiredState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.desiredLocked("")
+}
 
+// DesiredForCluster computes per-node digests restricted to nodes belonging to clusterID.
+func (s *Store) DesiredForCluster(clusterID string) types.DesiredState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.desiredLocked(clusterID)
+}
+
+func (s *Store) desiredLocked(clusterID string) types.DesiredState {
 	// Replay tree ops into effective set per node.
 	type set map[string]struct{}
 	loaded := map[string]set{}
-	for id := range s.Nodes {
+	for id, n := range s.Nodes {
+		if clusterID != "" && n.ClusterID != clusterID {
+			continue
+		}
 		loaded[id] = set{}
 	}
 
 	for _, op := range s.Tree {
 		for _, n := range s.Nodes {
+			if clusterID != "" && n.ClusterID != clusterID {
+				continue
+			}
 			if !matchSelector(n.Labels, op.Selector) {
 				continue
 			}
@@ -409,7 +493,9 @@ func (s *Store) StartAttestCampaignBy(actor string) types.AttestCampaign {
 		actor = "api"
 	}
 	var nonce [16]byte
-	_, _ = rand.Read(nonce[:])
+	if _, err := rand.Read(nonce[:]); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
 	c := types.AttestCampaign{
 		ID:      id("attest"),
 		Nonce:   hex.EncodeToString(nonce[:]),
@@ -456,9 +542,41 @@ func (s *Store) ListCampaigns() []types.AttestCampaign {
 	return out
 }
 
+// ValidateNodesInCluster returns ErrClusterForbidden if any nodeID is unknown
+// or does not belong to clusterID.
+func (s *Store) ValidateNodesInCluster(nodeIDs []string, clusterID string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, nid := range nodeIDs {
+		n, ok := s.Nodes[nid]
+		if !ok || n.ClusterID != clusterID {
+			return ErrClusterForbidden
+		}
+	}
+	return nil
+}
+
 func (s *Store) SubmitAttest(campaignID string, results []types.AttestResult) (*types.AttestCampaign, error) {
+	return s.submitAttest(campaignID, "", results)
+}
+
+// SubmitAttestForCluster enforces that every result targets a known node
+// belonging to clusterID before recording attestation results.
+func (s *Store) SubmitAttestForCluster(campaignID, clusterID string, results []types.AttestResult) (*types.AttestCampaign, error) {
+	return s.submitAttest(campaignID, clusterID, results)
+}
+
+func (s *Store) submitAttest(campaignID, clusterID string, results []types.AttestResult) (*types.AttestCampaign, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if clusterID != "" {
+		for _, r := range results {
+			n, ok := s.Nodes[r.NodeID]
+			if !ok || n.ClusterID != clusterID {
+				return nil, ErrClusterForbidden
+			}
+		}
+	}
 	c, ok := s.Campaigns[campaignID]
 	if !ok {
 		return nil, fmt.Errorf("campaign not found")

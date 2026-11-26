@@ -71,7 +71,8 @@ type DesiredState struct {
 type Connector struct {
 	ID        string    `json:"id"`
 	ClusterID string    `json:"clusterId"`
-	Token     string    `json:"token,omitempty"`
+	Token     string    `json:"-"`
+	TokenHash string    `json:"tokenHash,omitempty"`
 	Enrolled  time.Time `json:"enrolledAt"`
 }
 
