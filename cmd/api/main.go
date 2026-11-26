@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,12 @@ import (
 )
 
 func main() {
+	shirudoBin := flag.String("shirudo-bin", os.Getenv("SHIRUDO_BIN"), "path to shirudo binary for attestation verification (empty preserves mock behavior)")
+	shirudoAKName := flag.String("shirudo-ak-name", os.Getenv("SHIRUDO_AK_NAME"), "default AK name hex for shirudo attest verify")
+	shirudoExpectConfigRoot := flag.String("shirudo-expect-config-root", os.Getenv("SHIRUDO_EXPECT_CONFIG_ROOT"), "optional --expect-config-root for shirudo attest verify")
+	shirudoExpectConfigPCR := flag.String("shirudo-expect-config-pcr", os.Getenv("SHIRUDO_EXPECT_CONFIG_PCR"), "optional --expect-config-pcr for shirudo attest verify")
+	flag.Parse()
+
 	addr := env("TREEWARD_ADDR", ":8080")
 	bootstrap := env("TREEWARD_BOOTSTRAP_TOKEN", "dev-bootstrap")
 	keyDir := env("TREEWARD_KEY_DIR", "/var/treeward/keys")
@@ -32,6 +39,15 @@ func main() {
 	log.Printf("sqlite store %s (connectors=%d artifacts=%d)", dbPath, len(st.Connectors), len(st.Artifacts))
 
 	srv := api.New(st)
+	if *shirudoBin != "" {
+		srv.Verifier = api.NewShirudoVerifier(api.ShirudoVerifierConfig{
+			Bin:              *shirudoBin,
+			AKName:           *shirudoAKName,
+			ExpectConfigRoot: *shirudoExpectConfigRoot,
+			ExpectConfigPCR:  *shirudoExpectConfigPCR,
+		})
+		log.Printf("shirudo attest verifier enabled (bin=%s)", *shirudoBin)
+	}
 	log.Printf("treeward api listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, srv.Mux))
 }

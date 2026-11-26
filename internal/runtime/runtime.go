@@ -32,16 +32,21 @@ type Runtime interface {
 	Attest(nonce string, nodes []types.Node, loaded map[string][]string) ([]types.AttestResult, error)
 }
 
-// NewFromEnv selects a Runtime from TREEWARD_RUNTIME (stub|shirudo; default stub).
-func NewFromEnv() (Runtime, error) {
-	switch strings.ToLower(strings.TrimSpace(env("TREEWARD_RUNTIME", "stub"))) {
-	case "stub", "":
+// New selects a Runtime by name (stub|mock|shirudo; default stub).
+func New(kind string) (Runtime, error) {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "stub", "mock", "":
 		return NewStubFromEnv(), nil
 	case "shirudo":
 		return NewShirudo(), nil
 	default:
-		return nil, fmt.Errorf("unknown TREEWARD_RUNTIME %q (want stub|shirudo)", os.Getenv("TREEWARD_RUNTIME"))
+		return nil, fmt.Errorf("unknown runtime %q (want stub|mock|shirudo)", kind)
 	}
+}
+
+// NewFromEnv selects a Runtime from TREEWARD_RUNTIME (stub|mock|shirudo; default stub).
+func NewFromEnv() (Runtime, error) {
+	return New(env("TREEWARD_RUNTIME", "stub"))
 }
 
 func env(k, def string) string {

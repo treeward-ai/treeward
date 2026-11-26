@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"io"
 	"log"
 	"net/http"
@@ -15,14 +16,18 @@ import (
 )
 
 // Node agent: poll connector desired state → runtime.Apply → report →
-// poll attest → runtime.Attest → submit. Backend selected via TREEWARD_RUNTIME.
+// poll attest → runtime.Attest → submit. Backend selected via --runtime or TREEWARD_RUNTIME.
 func main() {
+	runtimeFlag := flag.String("runtime", env("TREEWARD_RUNTIME", "stub"), "runtime backend (stub|mock|shirudo)")
+	flag.Parse()
+
 	connector := env("TREEWARD_CONNECTOR_URL", "http://treeward-connector:8090")
-	rt, err := runtime.NewFromEnv()
+	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
+	kind := *runtimeFlag
+	rt, err := runtime.New(kind)
 	if err != nil {
 		log.Fatalf("runtime: %v", err)
 	}
-	kind := env("TREEWARD_RUNTIME", "stub")
 	interval := 3 * time.Second
 
 	nodes, err := rt.Inventory()
@@ -38,7 +43,7 @@ func main() {
 		var loaded map[string][]string
 		var applyErrs map[string][]string
 
-		desired, err := getDesired(connector)
+		desired, err := getDesired(connector, localToken)
 		if err != nil {
 			log.Printf("desired: %v", err)
 		} else {
@@ -75,11 +80,11 @@ func main() {
 			reports = append(reports, rep)
 		}
 
-		if err := postReport(connector, reports); err != nil {
+		if err := postReport(connector, localToken, reports); err != nil {
 			log.Printf("report: %v", err)
 		}
 
-		if pending, err := getPendingAttest(connector); err != nil {
+		if pending, err := getPendingAttest(connector, localToken); err != nil {
 			log.Printf("attest poll: %v", err)
 		} else if pending != nil && pending.ID != lastAttest {
 			loadedForAttest := map[string][]string{}
@@ -89,7 +94,7 @@ func main() {
 			quotes, err := rt.Attest(pending.Nonce, nodes, loadedForAttest)
 			if err != nil {
 				log.Printf("attest: %v", err)
-			} else if err := postAttest(connector, quotes); err != nil {
+			} else if err := postAttest(connector, localToken, quotes); err != nil {
 				log.Printf("attest submit: %v", err)
 			} else {
 				log.Printf("attest submitted campaign=%s nodes=%d", pending.ID, len(quotes))
@@ -101,9 +106,14 @@ func main() {
 	}
 }
 
-func getDesired(connector string) (types.DesiredState, error) {
+func getDesired(connector, localToken string) (types.DesiredState, error) {
 	var out types.DesiredState
-	res, err := http.Get(strings.TrimRight(connector, "/") + "/v1/local/desired")
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(connector, "/")+"/v1/local/desired", nil)
+	if err != nil {
+		return out, err
+	}
+	setBearerAuth(req, localToken)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return out, err
 	}
@@ -116,8 +126,13 @@ func getDesired(connector string) (types.DesiredState, error) {
 	return out, err
 }
 
-func getPendingAttest(connector string) (*types.PendingAttest, error) {
-	res, err := http.Get(strings.TrimRight(connector, "/") + "/v1/local/attest")
+func getPendingAttest(connector, localToken string) (*types.PendingAttest, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(connector, "/")+"/v1/local/attest", nil)
+	if err != nil {
+		return nil, err
+	}
+	setBearerAuth(req, localToken)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -136,17 +151,23 @@ func getPendingAttest(connector string) (*types.PendingAttest, error) {
 	return &p, nil
 }
 
-func postReport(connector string, reports []types.AgentReport) error {
-	return postJSON(strings.TrimRight(connector, "/")+"/v1/local/report", reports)
+func postReport(connector, localToken string, reports []types.AgentReport) error {
+	return postJSON(strings.TrimRight(connector, "/")+"/v1/local/report", localToken, reports)
 }
 
-func postAttest(connector string, results []types.AttestResult) error {
-	return postJSON(strings.TrimRight(connector, "/")+"/v1/local/attest", results)
+func postAttest(connector, localToken string, results []types.AttestResult) error {
+	return postJSON(strings.TrimRight(connector, "/")+"/v1/local/attest", localToken, results)
 }
 
-func postJSON(url string, body any) error {
+func postJSON(url, localToken string, body any) error {
 	b, _ := json.Marshal(body)
-	res, err := http.Post(url, "application/json", bytes.NewReader(b))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBearerAuth(req, localToken)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -156,6 +177,12 @@ func postJSON(url string, body any) error {
 		return &httpError{res.StatusCode, string(data)}
 	}
 	return nil
+}
+
+func setBearerAuth(req *http.Request, token string) {
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 type httpError struct {

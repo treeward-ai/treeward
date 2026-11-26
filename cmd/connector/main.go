@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -28,24 +31,15 @@ func main() {
 	bootstrap := env("TREEWARD_BOOTSTRAP_TOKEN", "dev-bootstrap")
 	cluster := env("TREEWARD_CLUSTER", "kind-treeward")
 	listen := env("TREEWARD_CONNECTOR_ADDR", ":8090")
+	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
 	interval := 5 * time.Second
 
-	var credMu sync.Mutex
-	token, clusterID := enrollWithRetry(apiURL, bootstrap, cluster)
+	creds := newCredManager(apiURL, bootstrap, cluster, enroll)
+	if err := creds.enrollWithRetry(30); err != nil {
+		log.Fatalf("enroll failed: %v", err)
+	}
+	_, clusterID := creds.snapshot()
 	log.Printf("enrolled connector cluster=%s", clusterID)
-
-	reenrol := func() {
-		credMu.Lock()
-		defer credMu.Unlock()
-		tok, cid := enrollWithRetry(apiURL, bootstrap, cluster)
-		token, clusterID = tok, cid
-		log.Printf("re-enrolled connector cluster=%s", clusterID)
-	}
-	tokenSnapshot := func() (string, string) {
-		credMu.Lock()
-		defer credMu.Unlock()
-		return token, clusterID
-	}
 
 	var mu sync.Mutex
 	agents := map[string]*agentState{}
@@ -59,13 +53,13 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.HandleFunc("POST /v1/local/report", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/local/report", requireLocalAuth(localToken, func(w http.ResponseWriter, r *http.Request) {
 		var reports []types.AgentReport
 		if err := json.NewDecoder(r.Body).Decode(&reports); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		_, cid := tokenSnapshot()
+		_, cid := creds.snapshot()
 		mu.Lock()
 		for _, rep := range reports {
 			rep.Node.ClusterID = cid
@@ -73,16 +67,19 @@ func main() {
 		}
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
-	mux.HandleFunc("GET /v1/local/desired", func(w http.ResponseWriter, _ *http.Request) {
-		tok, _ := tokenSnapshot()
+	mux.HandleFunc("GET /v1/local/desired", requireLocalAuth(localToken, func(w http.ResponseWriter, _ *http.Request) {
+		tok, _ := creds.snapshot()
 		desired, err := getDesired(apiURL, tok)
 		if err != nil {
 			if isUnauthorized(err) {
-				reenrol()
-				tok, _ = tokenSnapshot()
-				desired, err = getDesired(apiURL, tok)
+				if rerr := creds.reenroll(tok); rerr != nil {
+					log.Printf("re-enroll: %v", rerr)
+				} else {
+					tok, _ = creds.snapshot()
+					desired, err = getDesired(apiURL, tok)
+				}
 			}
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
@@ -90,9 +87,9 @@ func main() {
 			}
 		}
 		writeJSON(w, desired)
-	})
+	}))
 
-	mux.HandleFunc("GET /v1/local/attest", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/local/attest", requireLocalAuth(localToken, func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		p := pending
 		mu.Unlock()
@@ -101,9 +98,9 @@ func main() {
 			return
 		}
 		writeJSON(w, p)
-	})
+	}))
 
-	mux.HandleFunc("POST /v1/local/attest", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/local/attest", requireLocalAuth(localToken, func(w http.ResponseWriter, r *http.Request) {
 		var results []types.AttestResult
 		if err := json.NewDecoder(r.Body).Decode(&results); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -137,12 +134,15 @@ func main() {
 		mu.Unlock()
 
 		if ready && !already {
-			tok, _ := tokenSnapshot()
+			tok, _ := creds.snapshot()
 			if err := postJSON(apiURL+"/v1/attest/campaigns/"+campID+"/results", tok, batch, nil); err != nil {
 				if isUnauthorized(err) {
-					reenrol()
-					tok, _ = tokenSnapshot()
-					err = postJSON(apiURL+"/v1/attest/campaigns/"+campID+"/results", tok, batch, nil)
+					if rerr := creds.reenroll(tok); rerr != nil {
+						log.Printf("re-enroll: %v", rerr)
+					} else {
+						tok, _ = creds.snapshot()
+						err = postJSON(apiURL+"/v1/attest/campaigns/"+campID+"/results", tok, batch, nil)
+					}
 				}
 				if err != nil {
 					log.Printf("attest submit: %v", err)
@@ -158,13 +158,13 @@ func main() {
 			log.Printf("attest campaign %s submitted (%d quotes)", campID, len(batch))
 		}
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for range t.C {
-			tok, cid := tokenSnapshot()
+			tok, cid := creds.snapshot()
 			mu.Lock()
 			nodes := make([]types.Node, 0, len(agents))
 			reports := make([]types.AgentReport, 0, len(agents))
@@ -183,9 +183,12 @@ func main() {
 			if len(nodes) > 0 {
 				if err := upsertInventory(apiURL, tok, cid, nodes); err != nil {
 					if isUnauthorized(err) {
-						reenrol()
-						tok, cid = tokenSnapshot()
-						err = upsertInventory(apiURL, tok, cid, nodes)
+						if rerr := creds.reenroll(tok); rerr != nil {
+							log.Printf("re-enroll: %v", rerr)
+						} else {
+							tok, cid = creds.snapshot()
+							err = upsertInventory(apiURL, tok, cid, nodes)
+						}
 					}
 					if err != nil {
 						log.Printf("inventory upsert: %v", err)
@@ -193,9 +196,12 @@ func main() {
 				}
 				if err := postJSON(apiURL+"/v1/agents/report", tok, reports, nil); err != nil {
 					if isUnauthorized(err) {
-						reenrol()
-						tok, _ = tokenSnapshot()
-						err = postJSON(apiURL+"/v1/agents/report", tok, reports, nil)
+						if rerr := creds.reenroll(tok); rerr != nil {
+							log.Printf("re-enroll: %v", rerr)
+						} else {
+							tok, _ = creds.snapshot()
+							err = postJSON(apiURL+"/v1/agents/report", tok, reports, nil)
+						}
 					}
 					if err != nil {
 						log.Printf("agent report: %v", err)
@@ -206,9 +212,12 @@ func main() {
 			p, err := getActiveAttest(apiURL, tok)
 			if err != nil {
 				if isUnauthorized(err) {
-					reenrol()
-					tok, _ = tokenSnapshot()
-					p, err = getActiveAttest(apiURL, tok)
+					if rerr := creds.reenroll(tok); rerr != nil {
+						log.Printf("re-enroll: %v", rerr)
+					} else {
+						tok, _ = creds.snapshot()
+						p, err = getActiveAttest(apiURL, tok)
+					}
 				}
 				if err != nil {
 					log.Printf("attest poll: %v", err)
@@ -233,17 +242,132 @@ func main() {
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
 
-func enrollWithRetry(apiURL, bootstrap, cluster string) (token, clusterID string) {
-	for i := 0; i < 30; i++ {
-		tok, cid, err := enroll(apiURL, bootstrap, cluster)
-		if err == nil {
-			return tok, cid
-		}
-		log.Printf("enroll retry: %v", err)
-		time.Sleep(2 * time.Second)
+type credManager struct {
+	mu                sync.Mutex
+	apiURL            string
+	bootstrap         string
+	cluster           string
+	token             string
+	clusterID         string
+	lastAttempt       time.Time
+	backoff           time.Duration
+	bootstrapRejected bool
+	enrollFn          func(apiURL, bootstrap, cluster string) (string, string, error)
+	nowFn             func() time.Time
+	sleepFn           func(time.Duration)
+}
+
+func newCredManager(apiURL, bootstrap, cluster string, enrollFn func(string, string, string) (string, string, error)) *credManager {
+	return &credManager{
+		apiURL:    apiURL,
+		bootstrap: bootstrap,
+		cluster:   cluster,
+		enrollFn:  enrollFn,
+		nowFn:     time.Now,
+		sleepFn:   time.Sleep,
 	}
-	log.Fatal("enroll failed after retries")
-	return "", ""
+}
+
+func (c *credManager) snapshot() (string, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.token, c.clusterID
+}
+
+func (c *credManager) enrollWithRetry(maxAttempts int) error {
+	delay := time.Second
+	for i := 0; i < maxAttempts; i++ {
+		tok, cid, err := c.enrollFn(c.apiURL, c.bootstrap, c.cluster)
+		if err == nil {
+			c.mu.Lock()
+			c.token = tok
+			c.clusterID = cid
+			c.backoff = 0
+			c.bootstrapRejected = false
+			c.mu.Unlock()
+			return nil
+		}
+		if isAuthRejected(err) {
+			c.mu.Lock()
+			c.bootstrapRejected = true
+			c.mu.Unlock()
+			return fmt.Errorf("bootstrap token rejected: %w", err)
+		}
+		log.Printf("enroll retry %d/%d: %v", i+1, maxAttempts, err)
+		c.sleepFn(delay)
+		if delay < 10*time.Second {
+			delay *= 2
+			if delay > 10*time.Second {
+				delay = 10 * time.Second
+			}
+		}
+	}
+	return errors.New("enroll failed after retries")
+}
+
+func (c *credManager) reenroll(failedToken string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if failedToken != "" && c.token != "" && c.token != failedToken {
+		return nil
+	}
+	// Clear stale token so subsequent calls don't keep reusing it.
+	c.token = ""
+
+	if c.bootstrapRejected {
+		return errors.New("re-enroll halted: bootstrap token rejected")
+	}
+
+	now := c.nowFn()
+	if !c.lastAttempt.IsZero() && c.backoff > 0 && now.Sub(c.lastAttempt) < c.backoff {
+		return fmt.Errorf("re-enroll backed off (%s remaining)", (c.backoff - now.Sub(c.lastAttempt)).Round(time.Millisecond))
+	}
+
+	c.lastAttempt = now
+	tok, cid, err := c.enrollFn(c.apiURL, c.bootstrap, c.cluster)
+	if err != nil {
+		if isAuthRejected(err) {
+			c.bootstrapRejected = true
+			return fmt.Errorf("re-enroll halted: bootstrap token rejected: %w", err)
+		}
+		if c.backoff == 0 {
+			c.backoff = time.Second
+		} else {
+			c.backoff *= 2
+			if c.backoff > 30*time.Second {
+				c.backoff = 30 * time.Second
+			}
+		}
+		return err
+	}
+
+	c.token = tok
+	c.clusterID = cid
+	c.backoff = 0
+	c.bootstrapRejected = false
+	log.Printf("re-enrolled connector cluster=%s", cid)
+	return nil
+}
+
+func requireLocalAuth(expectedToken string, next http.HandlerFunc) http.HandlerFunc {
+	if expectedToken == "" {
+		return next
+	}
+	expected := []byte(expectedToken)
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		got := []byte(strings.TrimPrefix(auth, "Bearer "))
+		if subtle.ConstantTimeCompare(got, expected) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func enroll(apiURL, bootstrap, cluster string) (token, clusterID string, err error) {
@@ -349,10 +473,22 @@ func isUnauthorized(err error) bool {
 	if err == nil {
 		return false
 	}
-	if he, ok := err.(*httpError); ok {
+	var he *httpError
+	if errors.As(err, &he) {
 		return he.code == http.StatusUnauthorized || strings.Contains(he.body, "unauthorized")
 	}
 	return strings.Contains(err.Error(), "unauthorized")
+}
+
+func isAuthRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.code == http.StatusUnauthorized || he.code == http.StatusForbidden
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

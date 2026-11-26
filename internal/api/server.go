@@ -10,12 +10,19 @@ import (
 )
 
 type Server struct {
-	Store *store.Store
-	Mux   *http.ServeMux
+	Store    *store.Store
+	Mux      *http.ServeMux
+	Verifier AttestVerifier
 }
 
 func New(st *store.Store) *Server {
-	s := &Server{Store: st, Mux: http.NewServeMux()}
+	s := &Server{
+		Store: st,
+		Mux:   http.NewServeMux(),
+	}
+	if v := NewShirudoVerifierFromEnv(); v != nil {
+		s.Verifier = v
+	}
 	s.routes()
 	return s
 }
@@ -233,7 +240,15 @@ func (s *Server) handleAttestResults(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	c, err := s.Store.SubmitAttest(r.PathValue("id"), results)
+	campaignID := r.PathValue("id")
+	if s.Verifier != nil {
+		if c, ok := s.Store.GetCampaign(campaignID); ok {
+			for i := range results {
+				results[i] = s.Verifier.VerifyResult(r.Context(), c.Nonce, results[i])
+			}
+		}
+	}
+	c, err := s.Store.SubmitAttest(campaignID, results)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
