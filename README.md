@@ -60,3 +60,10 @@ cmd/api|connector|agent|treeward
 internal/{api,store,signer,types}
 deploy/k8s/treeward.yaml
 ```
+
+### Shirudo runtime revert & ownership
+
+When running the agent with `TREEWARD_RUNTIME=shirudo`:
+
+- **Signed unload directives:** Operators build a signed UNLOAD directive alongside each upatch artifact using the convention `<SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. Treeward never holds the operator signing key; on revert, the agent invokes `shirudo-runtime upatch unload <SHIRUDO_UPATCH_DIR>/<name>.unload.upatch`. If the directive file is missing, the agent logs an error and skips the unload call.
+- **Ownership tracking:** The agent persists the set of upatches that have appeared in a Treeward desired state in `<SHIRUDO_STATE_DIR>/owned.json` (default `/var/lib/treeward-agent/owned.json`). Externally loaded upatches not present in `owned.json` (such as `app-sandbox`) are never unloaded by Treeward.

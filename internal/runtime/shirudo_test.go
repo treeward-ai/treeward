@@ -112,10 +112,23 @@ echo "unexpected args: $@" >&2
 exit 1
 `)
 
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+
+	// Seed owned state and signed unload directive for old-patch.
+	if err := os.WriteFile(filepath.Join(stateDir, "owned.json"), []byte(`["old-patch","keep-patch"]`), 0o644); err != nil {
+		t.Fatalf("write owned.json: %v", err)
+	}
+	directivePath := filepath.Join(upatchDir, "old-patch.unload.upatch")
+	if err := os.WriteFile(directivePath, []byte("signed-unload-directive"), 0o644); err != nil {
+		t.Fatalf("write unload directive: %v", err)
+	}
+
 	rt := NewShirudo(
 		WithShirudoBin(bin),
 		WithNodeID("node-1"),
-		WithUpatchDir("/var/lib/shirudo/upatches"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
 	)
 
 	desired := types.DesiredState{
@@ -139,8 +152,191 @@ exit 1
 	calls := readCallLog(t, logPath)
 	wantCalls := []string{
 		"status --json",
-		"upatch load /var/lib/shirudo/upatches/new-patch",
-		"upatch unload old-patch",
+		"upatch load " + filepath.Join(upatchDir, "new-patch"),
+		"upatch unload " + directivePath,
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v", calls, wantCalls)
+	}
+}
+
+func TestShirudoApplyUnloadMissingDirective(t *testing.T) {
+	bin, logPath := writeFakeShirudo(t, `
+case "$1" in
+  status)
+    echo '{"status":"ok","upatches_loaded":["old-patch"]}'
+    exit 0
+    ;;
+  upatch)
+    echo "should not be called" >&2
+    exit 1
+    ;;
+esac
+exit 1
+`)
+
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateDir, "owned.json"), []byte(`["old-patch"]`), 0o644); err != nil {
+		t.Fatalf("write owned.json: %v", err)
+	}
+
+	rt := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+	)
+
+	loaded, errs, err := rt.Apply(types.DesiredState{
+		Nodes: map[string][]string{"node-1": {}},
+	})
+	if err != nil {
+		t.Fatalf("Apply() top-level error: %v", err)
+	}
+	if !reflect.DeepEqual(loaded["node-1"], []string{"old-patch"}) {
+		t.Fatalf("loaded[node-1] = %v, want [old-patch]", loaded["node-1"])
+	}
+	if len(errs["node-1"]) != 1 || !strings.Contains(errs["node-1"][0], "missing unload directive") {
+		t.Fatalf("errs[node-1] = %v, want missing unload directive error", errs["node-1"])
+	}
+
+	calls := readCallLog(t, logPath)
+	wantCalls := []string{"status --json"}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v (no unload call should be made)", calls, wantCalls)
+	}
+}
+
+func TestShirudoApplySkipsExternalUpatch(t *testing.T) {
+	bin, logPath := writeFakeShirudo(t, `
+case "$1" in
+  status)
+    echo '{"status":"ok","upatches_loaded":["app-sandbox"]}'
+    exit 0
+    ;;
+  upatch)
+    echo "should not unload external upatch" >&2
+    exit 1
+    ;;
+esac
+exit 1
+`)
+
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+	// Even if a directive file happened to exist, an external upatch not in owned.json must never be unloaded.
+	if err := os.WriteFile(filepath.Join(upatchDir, "app-sandbox.unload.upatch"), []byte("directive"), 0o644); err != nil {
+		t.Fatalf("write directive: %v", err)
+	}
+
+	rt := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+	)
+
+	loaded, errs, err := rt.Apply(types.DesiredState{
+		Nodes: map[string][]string{"node-1": {}},
+	})
+	if err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("Apply() errs = %v, want empty", errs)
+	}
+	if !reflect.DeepEqual(loaded["node-1"], []string{"app-sandbox"}) {
+		t.Fatalf("loaded[node-1] = %v, want [app-sandbox]", loaded["node-1"])
+	}
+
+	calls := readCallLog(t, logPath)
+	if !reflect.DeepEqual(calls, []string{"status --json"}) {
+		t.Fatalf("calls = %v, want [status --json]", calls)
+	}
+}
+
+func TestShirudoApplyOwnedUpatchDroppedFromDesiredIsUnloaded(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "loaded.txt")
+	bin, logPath := writeFakeShirudo(t, `
+STATE_FILE="`+stateFile+`"
+case "$1" in
+  status)
+    if [ -f "$STATE_FILE" ]; then
+      echo '{"status":"ok","upatches_loaded":["app-sandbox","managed-patch"]}'
+    else
+      echo '{"status":"ok","upatches_loaded":["app-sandbox"]}'
+    fi
+    exit 0
+    ;;
+  upatch)
+    if [ "$2" = "load" ] && [ -n "$3" ]; then
+      touch "$STATE_FILE"
+      exit 0
+    fi
+    if [ "$2" = "unload" ] && [ -n "$3" ]; then
+      rm -f "$STATE_FILE"
+      exit 0
+    fi
+    ;;
+esac
+echo "unexpected args: $@" >&2
+exit 1
+`)
+
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+	directivePath := filepath.Join(upatchDir, "managed-patch.unload.upatch")
+	if err := os.WriteFile(directivePath, []byte("signed-unload-directive"), 0o644); err != nil {
+		t.Fatalf("write directive: %v", err)
+	}
+
+	// Cycle 1: managed-patch is desired -> loaded and recorded in owned.json.
+	rt1 := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+	)
+	loaded, errs, err := rt1.Apply(types.DesiredState{
+		Nodes: map[string][]string{"node-1": {"managed-patch"}},
+	})
+	if err != nil {
+		t.Fatalf("cycle 1 Apply() error: %v", err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("cycle 1 errs = %v, want empty", errs)
+	}
+	if !reflect.DeepEqual(loaded["node-1"], []string{"app-sandbox", "managed-patch"}) {
+		t.Fatalf("cycle 1 loaded = %v, want [app-sandbox managed-patch]", loaded["node-1"])
+	}
+
+	// Cycle 2 (fresh runtime instance reading persisted owned.json): managed-patch dropped from desired.
+	rt2 := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+	)
+	loaded, errs, err = rt2.Apply(types.DesiredState{
+		Nodes: map[string][]string{"node-1": {}},
+	})
+	if err != nil {
+		t.Fatalf("cycle 2 Apply() error: %v", err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("cycle 2 errs = %v, want empty", errs)
+	}
+	if !reflect.DeepEqual(loaded["node-1"], []string{"app-sandbox"}) {
+		t.Fatalf("cycle 2 loaded = %v, want [app-sandbox]", loaded["node-1"])
+	}
+
+	calls := readCallLog(t, logPath)
+	wantCalls := []string{
+		"status --json",
+		"upatch load " + filepath.Join(upatchDir, "managed-patch"),
+		"status --json",
+		"upatch unload " + directivePath,
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("calls = %v, want %v", calls, wantCalls)
@@ -164,7 +360,7 @@ esac
 exit 1
 `)
 
-	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"))
+	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithStateDir(t.TempDir()))
 	loaded, errs, err := rt.Apply(types.DesiredState{
 		Nodes: map[string][]string{"node-1": {"bad-patch"}},
 	})
@@ -189,7 +385,7 @@ echo "unexpected args: $@" >&2
 exit 1
 `)
 
-	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"))
+	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithStateDir(t.TempDir()))
 	nodes := []types.Node{{ID: "node-1"}}
 	results, err := rt.Attest("a1b2c3d4", nodes, nil)
 	if err != nil {

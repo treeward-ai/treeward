@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,14 @@ import (
 
 // DefaultShirudoBin is the default path to the shirudo-runtime CLI.
 const DefaultShirudoBin = "/usr/local/bin/shirudo-runtime"
+
+// DefaultShirudoStateDir is the default directory for persisting Treeward-owned upatch state.
+const DefaultShirudoStateDir = "/var/lib/treeward-agent"
+
+const (
+	ownedStateFilename    = "owned.json"
+	unloadDirectiveSuffix = ".unload.upatch"
+)
 
 // ShirudoStatus represents the JSON output of `shirudo-runtime status --json`.
 type ShirudoStatus struct {
@@ -99,23 +108,45 @@ func WithHostname(hostname string) ShirudoOption {
 	}
 }
 
-// WithUpatchDir sets a base directory prepended to relative upatch paths on load.
+// WithUpatchDir sets a base directory prepended to relative upatch paths on load
+// and used to resolve signed unload directives (<upatchDir>/<name>.unload.upatch).
 func WithUpatchDir(dir string) ShirudoOption {
 	return func(s *ShirudoRuntime) {
 		s.upatchDir = dir
 	}
 }
 
+// WithStateDir sets the directory used to persist Treeward-owned upatch state (owned.json).
+func WithStateDir(dir string) ShirudoOption {
+	return func(s *ShirudoRuntime) {
+		s.stateDir = dir
+	}
+}
+
 // ShirudoRuntime implements Runtime by shelling out to the shirudo-runtime CLI.
+//
+// Revert / unload convention: the operator builds a signed UNLOAD directive
+// alongside each upatch artifact at <upatchDir>/<name>.unload.upatch. Treeward
+// never holds the operator signing key; UnloadUpatch passes that directive path
+// to `shirudo-runtime upatch unload <path>`.
+//
+// Ownership: Apply tracks upatches that appeared in a Treeward desired set in
+// <stateDir>/owned.json (SHIRUDO_STATE_DIR, default /var/lib/treeward-agent).
+// Externally loaded upatches not present in owned.json are never unloaded.
 type ShirudoRuntime struct {
-	bin       string
-	nodeID    string
-	hostname  string
-	upatchDir string
+	bin            string
+	nodeID         string
+	hostname       string
+	upatchDir      string
+	stateDir       string
+	ownedLoaded    bool
+	owned          map[string]bool
+	loggedExternal map[string]bool
 }
 
 // NewShirudo constructs a ShirudoRuntime configured from environment variables
-// (SHIRUDO_RUNTIME_BIN, NODE_NAME/HOSTNAME, SHIRUDO_UPATCH_DIR) and optional overrides.
+// (SHIRUDO_RUNTIME_BIN, NODE_NAME/HOSTNAME, SHIRUDO_UPATCH_DIR, SHIRUDO_STATE_DIR)
+// and optional overrides.
 func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 	host, _ := os.Hostname()
 	hostname := env("NODE_NAME", env("HOSTNAME", host))
@@ -124,10 +155,13 @@ func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 	}
 
 	s := &ShirudoRuntime{
-		bin:       env("SHIRUDO_RUNTIME_BIN", DefaultShirudoBin),
-		nodeID:    hostname,
-		hostname:  hostname,
-		upatchDir: env("SHIRUDO_UPATCH_DIR", ""),
+		bin:            env("SHIRUDO_RUNTIME_BIN", DefaultShirudoBin),
+		nodeID:         hostname,
+		hostname:       hostname,
+		upatchDir:      env("SHIRUDO_UPATCH_DIR", ""),
+		stateDir:       env("SHIRUDO_STATE_DIR", DefaultShirudoStateDir),
+		owned:          map[string]bool{},
+		loggedExternal: map[string]bool{},
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -158,10 +192,23 @@ func (s *ShirudoRuntime) LoadUpatch(path string) error {
 	return nil
 }
 
-// UnloadUpatch invokes `shirudo-runtime upatch unload <name>`.
+// UnloadDirectivePath returns the convention path for a signed UNLOAD directive:
+// <upatchDir>/<name>.unload.upatch.
+func (s *ShirudoRuntime) UnloadDirectivePath(name string) string {
+	return filepath.Join(s.upatchDir, name+unloadDirectiveSuffix)
+}
+
+// UnloadUpatch invokes `shirudo-runtime upatch unload <path>` using the signed
+// unload directive at <upatchDir>/<name>.unload.upatch. If the directive file
+// is absent, it logs a clear error and does not invoke shirudo-runtime.
 func (s *ShirudoRuntime) UnloadUpatch(name string) error {
-	if _, err := s.run("upatch", "unload", name); err != nil {
-		return fmt.Errorf("shirudo upatch unload %q: %w", name, err)
+	directivePath := s.UnloadDirectivePath(name)
+	if _, err := os.Stat(directivePath); err != nil {
+		log.Printf("shirudo: cannot unload %q: unload directive %q unavailable: %v", name, directivePath, err)
+		return fmt.Errorf("shirudo upatch unload %q: missing unload directive %q: %w", name, directivePath, err)
+	}
+	if _, err := s.run("upatch", "unload", directivePath); err != nil {
+		return fmt.Errorf("shirudo upatch unload %q (%q): %w", name, directivePath, err)
 	}
 	return nil
 }
@@ -227,6 +274,9 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 		return nil, nil, err
 	}
 
+	s.loadOwned()
+	ownedDirty := false
+
 	currentSet := make(map[string]struct{}, len(st.UpatchesLoaded))
 	for _, name := range st.UpatchesLoaded {
 		currentSet[name] = struct{}{}
@@ -236,6 +286,10 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 	wantSet := make(map[string]struct{}, len(want))
 	for _, d := range want {
 		wantSet[d] = struct{}{}
+		if !s.owned[d] {
+			s.owned[d] = true
+			ownedDirty = true
+		}
 	}
 
 	var nodeErrs []string
@@ -256,9 +310,16 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 		currentSet[d] = struct{}{}
 	}
 
-	// Unload currently loaded upatches that are no longer desired.
+	// Unload currently loaded upatches that are owned by Treeward and no longer desired.
 	for _, cur := range st.UpatchesLoaded {
 		if _, ok := wantSet[cur]; ok {
+			continue
+		}
+		if !s.owned[cur] {
+			if !s.loggedExternal[cur] {
+				log.Printf("shirudo: skipping externally loaded upatch %q (not managed by treeward)", cur)
+				s.loggedExternal[cur] = true
+			}
 			continue
 		}
 		if err := s.UnloadUpatch(cur); err != nil {
@@ -266,6 +327,12 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 			continue
 		}
 		delete(currentSet, cur)
+		delete(s.owned, cur)
+		ownedDirty = true
+	}
+
+	if ownedDirty {
+		s.saveOwned()
 	}
 
 	loadedSlice := make([]string, 0, len(currentSet))
@@ -282,6 +349,74 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 		errs[s.nodeID] = nodeErrs
 	}
 	return loaded, errs, nil
+}
+
+func (s *ShirudoRuntime) ownedStatePath() string {
+	return filepath.Join(s.stateDir, ownedStateFilename)
+}
+
+func (s *ShirudoRuntime) loadOwned() {
+	if s.ownedLoaded {
+		return
+	}
+	s.ownedLoaded = true
+	if s.owned == nil {
+		s.owned = map[string]bool{}
+	}
+	if s.loggedExternal == nil {
+		s.loggedExternal = map[string]bool{}
+	}
+	if s.stateDir == "" {
+		return
+	}
+	data, err := os.ReadFile(s.ownedStatePath())
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("shirudo: read owned state %q: %v", s.ownedStatePath(), err)
+		}
+		return
+	}
+	var names []string
+	if err := json.Unmarshal(data, &names); err != nil {
+		log.Printf("shirudo: decode owned state %q: %v", s.ownedStatePath(), err)
+		return
+	}
+	for _, name := range names {
+		if name != "" {
+			s.owned[name] = true
+		}
+	}
+}
+
+func (s *ShirudoRuntime) saveOwned() {
+	if s.stateDir == "" {
+		return
+	}
+	if err := os.MkdirAll(s.stateDir, 0o755); err != nil {
+		log.Printf("shirudo: create state dir %q: %v", s.stateDir, err)
+		return
+	}
+	names := make([]string, 0, len(s.owned))
+	for name, ok := range s.owned {
+		if ok {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	data, err := json.Marshal(names)
+	if err != nil {
+		log.Printf("shirudo: encode owned state: %v", err)
+		return
+	}
+	path := s.ownedStatePath()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("shirudo: write owned state %q: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("shirudo: rename owned state %q -> %q: %v", tmp, path, err)
+	}
 }
 
 func (s *ShirudoRuntime) Attest(nonce string, nodes []types.Node, loaded map[string][]string) ([]types.AttestResult, error) {
