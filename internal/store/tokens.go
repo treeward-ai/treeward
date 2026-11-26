@@ -104,7 +104,7 @@ func (s *Store) CreateToken(name string, expiresAt *time.Time) (*types.CreateTok
 		}
 	}
 	s.tokens[st.ID] = st
-	s.auditLocked("token.create", "bootstrap", "", "", "id="+st.ID+" name="+st.Name)
+	s.auditLocked("token.create", "admin-bootstrap", "", "", "id="+st.ID+" name="+st.Name)
 	s.persistLocked()
 
 	return &types.CreateTokenResponse{

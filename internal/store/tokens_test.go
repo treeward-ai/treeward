@@ -17,7 +17,7 @@ func TestSQLiteTokenHashingAndPersistence(t *testing.T) {
 		t.Fatalf("signer: %v", err)
 	}
 	dbPath := filepath.Join(dir, "treeward.db")
-	st, err := Open(dbPath, "test-bootstrap", sig)
+	st, err := Open(dbPath, "test-enroll", "test-admin-bootstrap", sig)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestSQLiteTokenHashingAndPersistence(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	st2, err := Open(dbPath, "test-bootstrap", sig)
+	st2, err := Open(dbPath, "test-enroll", "test-admin-bootstrap", sig)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestSQLiteTokenHashingAndPersistence(t *testing.T) {
 }
 
 func TestTokenExpiry(t *testing.T) {
-	st := New("test-bootstrap", nil)
+	st := New("test-enroll", "test-admin-bootstrap", nil)
 	past := time.Now().UTC().Add(-time.Minute)
 	expired, err := st.CreateToken("expired-op", &past)
 	if err != nil {

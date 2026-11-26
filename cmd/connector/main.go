@@ -28,16 +28,16 @@ type agentState struct {
 
 func main() {
 	apiURL := env("TREEWARD_API_URL", "http://treeward-api:8080")
-	bootstrap := os.Getenv("TREEWARD_BOOTSTRAP_TOKEN")
-	if bootstrap == "" {
-		log.Fatal("TREEWARD_BOOTSTRAP_TOKEN is required")
+	enrollToken := os.Getenv("TREEWARD_ENROLL_TOKEN")
+	if enrollToken == "" {
+		log.Fatal("TREEWARD_ENROLL_TOKEN is required")
 	}
 	cluster := env("TREEWARD_CLUSTER", "kind-treeward")
 	listen := env("TREEWARD_CONNECTOR_ADDR", ":8090")
 	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
 	interval := 5 * time.Second
 
-	creds := newCredManager(apiURL, bootstrap, cluster, enroll)
+	creds := newCredManager(apiURL, enrollToken, cluster, enroll)
 	if err := creds.enrollWithRetry(30); err != nil {
 		log.Fatalf("enroll failed: %v", err)
 	}
@@ -246,28 +246,28 @@ func main() {
 }
 
 type credManager struct {
-	mu                sync.Mutex
-	apiURL            string
-	bootstrap         string
-	cluster           string
-	token             string
-	clusterID         string
-	lastAttempt       time.Time
-	backoff           time.Duration
-	bootstrapRejected bool
-	enrollFn          func(apiURL, bootstrap, cluster string) (string, string, error)
-	nowFn             func() time.Time
-	sleepFn           func(time.Duration)
+	mu             sync.Mutex
+	apiURL         string
+	enrollToken    string
+	cluster        string
+	token          string
+	clusterID      string
+	lastAttempt    time.Time
+	backoff        time.Duration
+	enrollRejected bool
+	enrollFn       func(apiURL, enrollToken, cluster string) (string, string, error)
+	nowFn          func() time.Time
+	sleepFn        func(time.Duration)
 }
 
-func newCredManager(apiURL, bootstrap, cluster string, enrollFn func(string, string, string) (string, string, error)) *credManager {
+func newCredManager(apiURL, enrollToken, cluster string, enrollFn func(string, string, string) (string, string, error)) *credManager {
 	return &credManager{
-		apiURL:    apiURL,
-		bootstrap: bootstrap,
-		cluster:   cluster,
-		enrollFn:  enrollFn,
-		nowFn:     time.Now,
-		sleepFn:   time.Sleep,
+		apiURL:      apiURL,
+		enrollToken: enrollToken,
+		cluster:     cluster,
+		enrollFn:    enrollFn,
+		nowFn:       time.Now,
+		sleepFn:     time.Sleep,
 	}
 }
 
@@ -280,21 +280,21 @@ func (c *credManager) snapshot() (string, string) {
 func (c *credManager) enrollWithRetry(maxAttempts int) error {
 	delay := time.Second
 	for i := 0; i < maxAttempts; i++ {
-		tok, cid, err := c.enrollFn(c.apiURL, c.bootstrap, c.cluster)
+		tok, cid, err := c.enrollFn(c.apiURL, c.enrollToken, c.cluster)
 		if err == nil {
 			c.mu.Lock()
 			c.token = tok
 			c.clusterID = cid
 			c.backoff = 0
-			c.bootstrapRejected = false
+			c.enrollRejected = false
 			c.mu.Unlock()
 			return nil
 		}
 		if isAuthRejected(err) {
 			c.mu.Lock()
-			c.bootstrapRejected = true
+			c.enrollRejected = true
 			c.mu.Unlock()
-			return fmt.Errorf("bootstrap token rejected: %w", err)
+			return fmt.Errorf("enroll token rejected: %w", err)
 		}
 		log.Printf("enroll retry %d/%d: %v", i+1, maxAttempts, err)
 		c.sleepFn(delay)
@@ -318,8 +318,8 @@ func (c *credManager) reenroll(failedToken string) error {
 	// Clear stale token so subsequent calls don't keep reusing it.
 	c.token = ""
 
-	if c.bootstrapRejected {
-		return errors.New("re-enroll halted: bootstrap token rejected")
+	if c.enrollRejected {
+		return errors.New("re-enroll halted: enroll token rejected")
 	}
 
 	now := c.nowFn()
@@ -328,11 +328,11 @@ func (c *credManager) reenroll(failedToken string) error {
 	}
 
 	c.lastAttempt = now
-	tok, cid, err := c.enrollFn(c.apiURL, c.bootstrap, c.cluster)
+	tok, cid, err := c.enrollFn(c.apiURL, c.enrollToken, c.cluster)
 	if err != nil {
 		if isAuthRejected(err) {
-			c.bootstrapRejected = true
-			return fmt.Errorf("re-enroll halted: bootstrap token rejected: %w", err)
+			c.enrollRejected = true
+			return fmt.Errorf("re-enroll halted: enroll token rejected: %w", err)
 		}
 		if c.backoff == 0 {
 			c.backoff = time.Second
@@ -348,7 +348,7 @@ func (c *credManager) reenroll(failedToken string) error {
 	c.token = tok
 	c.clusterID = cid
 	c.backoff = 0
-	c.bootstrapRejected = false
+	c.enrollRejected = false
 	log.Printf("re-enrolled connector cluster=%s", cid)
 	return nil
 }
@@ -373,10 +373,10 @@ func requireLocalAuth(expectedToken string, next http.HandlerFunc) http.HandlerF
 	}
 }
 
-func enroll(apiURL, bootstrap, cluster string) (token, clusterID string, err error) {
+func enroll(apiURL, enrollToken, cluster string) (token, clusterID string, err error) {
 	var resp types.EnrollResponse
 	err = postJSON(apiURL+"/v1/connectors/enroll", "", types.EnrollRequest{
-		BootstrapToken: bootstrap,
+		BootstrapToken: enrollToken,
 		ClusterName:    cluster,
 	}, &resp)
 	return resp.Token, resp.ClusterID, err

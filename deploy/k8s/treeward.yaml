@@ -2,24 +2,33 @@
 #
 # Required Secrets (in namespace "treeward", created before applying):
 #
-#   1. Secret/treeward-bootstrap (key: token)
-#      Shared bootstrap secret used by:
+#   1. Secret/treeward-enroll (key: token)
+#      Connector enrollment secret used by:
 #        - treeward-api: validates connector enrollment (POST /v1/connectors/enroll)
-#          and operator token minting (POST /v1/tokens).
+#          via TREEWARD_ENROLL_TOKEN.
 #        - treeward-connector: enrolls with treeward-api on startup to obtain its
-#          managed connector bearer token.
+#          managed connector bearer token via TREEWARD_ENROLL_TOKEN.
 #
-#   2. Secret/treeward-local (key: token)
+#   2. Secret/treeward-admin-bootstrap (key: token)
+#      Admin operator token minting secret (MUST be distinct from treeward-enroll):
+#        - treeward-api ONLY: validates POST /v1/tokens via
+#          TREEWARD_ADMIN_BOOTSTRAP_TOKEN.
+#        - NEVER mounted into treeward-connector or treeward-agent.
+#
+#   3. Secret/treeward-local (key: token)
 #      Shared bearer token protecting the connector's local HTTP endpoints
 #      (/v1/local/*) between:
 #        - treeward-connector (server, TREEWARD_LOCAL_TOKEN)
 #        - treeward-agent (client, TREEWARD_LOCAL_TOKEN)
 #
-# `make quickstart` creates both Secrets automatically with random values stored
-# in `.treeward/quickstart.env` (mode 0600, gitignored). To create them manually:
+# `make quickstart` creates all three Secrets automatically with distinct random
+# values stored in `.treeward/quickstart.env` (mode 0600, gitignored). To create
+# them manually:
 #
 #   kubectl create namespace treeward --dry-run=client -o yaml | kubectl apply -f -
-#   kubectl -n treeward create secret generic treeward-bootstrap \
+#   kubectl -n treeward create secret generic treeward-enroll \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#   kubectl -n treeward create secret generic treeward-admin-bootstrap \
 #     --from-literal=token="$(openssl rand -hex 32)"
 #   kubectl -n treeward create secret generic treeward-local \
 #     --from-literal=token="$(openssl rand -hex 32)"
@@ -79,10 +88,15 @@ spec:
           env:
             - name: TREEWARD_ADDR
               value: ":8080"
-            - name: TREEWARD_BOOTSTRAP_TOKEN
+            - name: TREEWARD_ENROLL_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: treeward-bootstrap
+                  name: treeward-enroll
+                  key: token
+            - name: TREEWARD_ADMIN_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: treeward-admin-bootstrap
                   key: token
             - name: TREEWARD_KEY_DIR
               value: /var/treeward/keys
@@ -143,10 +157,10 @@ spec:
           env:
             - name: TREEWARD_API_URL
               value: http://treeward-api:8080
-            - name: TREEWARD_BOOTSTRAP_TOKEN
+            - name: TREEWARD_ENROLL_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: treeward-bootstrap
+                  name: treeward-enroll
                   key: token
             - name: TREEWARD_LOCAL_TOKEN
               valueFrom:

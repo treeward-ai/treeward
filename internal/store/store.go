@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -17,9 +18,10 @@ import (
 type Store struct {
 	mu sync.RWMutex
 
-	BootstrapToken string
-	Signer         signer.Signer
-	db             *sql.DB
+	EnrollToken         string
+	AdminBootstrapToken string
+	Signer              signer.Signer
+	db                  *sql.DB
 
 	Connectors map[string]*types.Connector // by token
 	Nodes      map[string]*types.Node
@@ -32,16 +34,17 @@ type Store struct {
 }
 
 // New returns an in-memory store (tests / no persistence).
-func New(bootstrap string, s signer.Signer) *Store {
+func New(enrollToken, adminBootstrapToken string, s signer.Signer) *Store {
 	return &Store{
-		BootstrapToken: bootstrap,
-		Signer:         s,
-		Connectors:     map[string]*types.Connector{},
-		Nodes:          map[string]*types.Node{},
-		Artifacts:      map[string]*types.Artifact{},
-		Bindings:       map[string]*types.Binding{},
-		Campaigns:      map[string]*types.AttestCampaign{},
-		tokens:         map[string]*storedToken{},
+		EnrollToken:         enrollToken,
+		AdminBootstrapToken: adminBootstrapToken,
+		Signer:              s,
+		Connectors:          map[string]*types.Connector{},
+		Nodes:               map[string]*types.Node{},
+		Artifacts:           map[string]*types.Artifact{},
+		Bindings:            map[string]*types.Binding{},
+		Campaigns:           map[string]*types.AttestCampaign{},
+		tokens:              map[string]*storedToken{},
 	}
 }
 
@@ -54,8 +57,8 @@ func id(prefix string) string {
 func (s *Store) Enroll(req types.EnrollRequest) (*types.EnrollResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if req.BootstrapToken != s.BootstrapToken {
-		return nil, fmt.Errorf("invalid bootstrap token")
+	if req.BootstrapToken == "" || s.EnrollToken == "" || subtle.ConstantTimeCompare([]byte(req.BootstrapToken), []byte(s.EnrollToken)) != 1 {
+		return nil, fmt.Errorf("invalid enroll token")
 	}
 	if req.ClusterName == "" {
 		req.ClusterName = "default"

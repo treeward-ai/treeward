@@ -14,7 +14,8 @@ PF_PIDFILE="${STATE_DIR}/port-forward.pid"
 PF_LOGFILE="${STATE_DIR}/port-forward.log"
 
 # Preserve any caller-provided environment overrides before sourcing state.
-CALLER_BOOTSTRAP="${TREEWARD_BOOTSTRAP_TOKEN:-}"
+CALLER_ENROLL="${TREEWARD_ENROLL_TOKEN:-}"
+CALLER_ADMIN_BOOTSTRAP="${TREEWARD_ADMIN_BOOTSTRAP_TOKEN:-}"
 CALLER_LOCAL="${TREEWARD_LOCAL_TOKEN:-}"
 CALLER_TOKEN="${TREEWARD_TOKEN:-}"
 CALLER_API_PORT="${TREEWARD_API_PORT:-}"
@@ -68,7 +69,8 @@ write_env_file() {
 TREEWARD_CLUSTER_NAME=${CLUSTER_NAME}
 TREEWARD_API_PORT=${API_PORT}
 TREEWARD_API_URL=${API_URL}
-TREEWARD_BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN}
+TREEWARD_ENROLL_TOKEN=${ENROLL_TOKEN}
+TREEWARD_ADMIN_BOOTSTRAP_TOKEN=${ADMIN_BOOTSTRAP_TOKEN}
 TREEWARD_LOCAL_TOKEN=${LOCAL_TOKEN}
 TREEWARD_TOKEN=${OPERATOR_TOKEN}
 EOF
@@ -81,12 +83,13 @@ load_or_init_secrets() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
-  local saved_bootstrap="" saved_local="" saved_token="" saved_port=""
+  local saved_enroll="" saved_admin_bootstrap="" saved_local="" saved_token="" saved_port=""
   if [[ -f "$ENV_FILE" ]]; then
     chmod 600 "$ENV_FILE"
     # shellcheck disable=SC1090
     source "$ENV_FILE"
-    saved_bootstrap="${TREEWARD_BOOTSTRAP_TOKEN:-}"
+    saved_enroll="${TREEWARD_ENROLL_TOKEN:-}"
+    saved_admin_bootstrap="${TREEWARD_ADMIN_BOOTSTRAP_TOKEN:-}"
     saved_local="${TREEWARD_LOCAL_TOKEN:-}"
     saved_token="${TREEWARD_TOKEN:-}"
     saved_port="${TREEWARD_API_PORT:-}"
@@ -95,12 +98,24 @@ load_or_init_secrets() {
   API_PORT="${CALLER_API_PORT:-${saved_port:-8080}}"
   API_URL="http://127.0.0.1:${API_PORT}"
 
-  if [[ -n "$CALLER_BOOTSTRAP" ]]; then
-    BOOTSTRAP_TOKEN="$CALLER_BOOTSTRAP"
-  elif [[ -n "$saved_bootstrap" ]]; then
-    BOOTSTRAP_TOKEN="$saved_bootstrap"
+  if [[ -n "$CALLER_ENROLL" ]]; then
+    ENROLL_TOKEN="$CALLER_ENROLL"
+  elif [[ -n "$saved_enroll" ]]; then
+    ENROLL_TOKEN="$saved_enroll"
   else
-    BOOTSTRAP_TOKEN="$(gen_secret)"
+    ENROLL_TOKEN="$(gen_secret)"
+  fi
+
+  if [[ -n "$CALLER_ADMIN_BOOTSTRAP" ]]; then
+    ADMIN_BOOTSTRAP_TOKEN="$CALLER_ADMIN_BOOTSTRAP"
+  elif [[ -n "$saved_admin_bootstrap" ]]; then
+    ADMIN_BOOTSTRAP_TOKEN="$saved_admin_bootstrap"
+  else
+    ADMIN_BOOTSTRAP_TOKEN="$(gen_secret)"
+  fi
+
+  if [[ "$ENROLL_TOKEN" == "$ADMIN_BOOTSTRAP_TOKEN" ]]; then
+    die "TREEWARD_ENROLL_TOKEN and TREEWARD_ADMIN_BOOTSTRAP_TOKEN must be distinct secrets."
   fi
 
   if [[ -n "$CALLER_LOCAL" ]]; then
@@ -181,8 +196,9 @@ deploy_manifests() {
   kubectl --context "$CONTEXT" create namespace "$NAMESPACE" --dry-run=client -o yaml \
     | kubectl --context "$CONTEXT" apply -f - >/dev/null
 
-  local prev_bootstrap_rv prev_local_rv
-  prev_bootstrap_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-bootstrap -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+  local prev_enroll_rv prev_admin_bootstrap_rv prev_local_rv
+  prev_enroll_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-enroll -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+  prev_admin_bootstrap_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-admin-bootstrap -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
   prev_local_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-local -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
 
   # Apply secrets via stdin so token values never appear in stdout or process args.
@@ -190,11 +206,20 @@ deploy_manifests() {
 apiVersion: v1
 kind: Secret
 metadata:
-  name: treeward-bootstrap
+  name: treeward-enroll
   namespace: ${NAMESPACE}
 type: Opaque
 stringData:
-  token: "${BOOTSTRAP_TOKEN}"
+  token: "${ENROLL_TOKEN}"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: treeward-admin-bootstrap
+  namespace: ${NAMESPACE}
+type: Opaque
+stringData:
+  token: "${ADMIN_BOOTSTRAP_TOKEN}"
 ---
 apiVersion: v1
 kind: Secret
@@ -206,13 +231,14 @@ stringData:
   token: "${LOCAL_TOKEN}"
 EOF
 
-  local new_bootstrap_rv new_local_rv
-  new_bootstrap_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-bootstrap -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+  local new_enroll_rv new_admin_bootstrap_rv new_local_rv
+  new_enroll_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-enroll -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
+  new_admin_bootstrap_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-admin-bootstrap -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
   new_local_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-local -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
 
   kubectl --context "$CONTEXT" apply -f "$ROOT/deploy/k8s/treeward.yaml"
 
-  if [[ ( -n "$prev_bootstrap_rv" && "$prev_bootstrap_rv" != "$new_bootstrap_rv" ) || ( -n "$prev_local_rv" && "$prev_local_rv" != "$new_local_rv" ) ]]; then
+  if [[ ( -n "$prev_enroll_rv" && "$prev_enroll_rv" != "$new_enroll_rv" ) || ( -n "$prev_admin_bootstrap_rv" && "$prev_admin_bootstrap_rv" != "$new_admin_bootstrap_rv" ) || ( -n "$prev_local_rv" && "$prev_local_rv" != "$new_local_rv" ) ]]; then
     log "Detected secret rotation; restarting workloads to pick up new tokens..."
     kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout restart \
       deploy/treeward-api deploy/treeward-connector ds/treeward-agent
@@ -295,13 +321,13 @@ mint_operator_token() {
   http_code="$(curl -sS -o "$resp_file" -w '%{http_code}' \
     -X POST \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer ${BOOTSTRAP_TOKEN}" \
+    -H "Authorization: Bearer ${ADMIN_BOOTSTRAP_TOKEN}" \
     -d '{"name":"quickstart-operator"}' \
     "${API_URL}/v1/tokens" || true)"
 
   if [[ "$http_code" != "201" ]]; then
     rm -f "$resp_file"
-    die "Failed to mint operator token (HTTP ${http_code}). Ensure Secret/treeward-bootstrap matches TREEWARD_BOOTSTRAP_TOKEN."
+    die "Failed to mint operator token (HTTP ${http_code}). Ensure Secret/treeward-admin-bootstrap matches TREEWARD_ADMIN_BOOTSTRAP_TOKEN."
   fi
 
   OPERATOR_TOKEN="$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$resp_file" | head -n1)"

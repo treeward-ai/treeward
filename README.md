@@ -28,7 +28,7 @@ make quickstart
 `make quickstart` is idempotent and handles everything from a clean checkout:
 
 1. Checks prerequisites and Docker availability.
-2. Generates random `TREEWARD_BOOTSTRAP_TOKEN` and `TREEWARD_LOCAL_TOKEN` secrets into `.treeward/quickstart.env` (mode `0600`, gitignored) on first run, reusing them on subsequent runs (or honoring explicit env overrides).
+2. Generates distinct random `TREEWARD_ENROLL_TOKEN`, `TREEWARD_ADMIN_BOOTSTRAP_TOKEN`, and `TREEWARD_LOCAL_TOKEN` secrets into `.treeward/quickstart.env` (mode `0600`, gitignored) on first run, reusing them on subsequent runs (or honoring explicit env overrides).
 3. Creates a dedicated Kind cluster named `treeward-quickstart` (skips creation if it already exists).
 4. Builds the `treeward:quickstart` image, loads it into Kind, and extracts `./bin/treeward` from the image (falling back to `go build` on non-Linux hosts).
 5. Applies Kubernetes Secrets and `deploy/k8s/treeward.yaml` (automatically restarting workloads if secrets changed on an existing cluster), then waits for `treeward-api`, `treeward-connector`, and `treeward-agent` rollouts.
@@ -82,7 +82,7 @@ Stops the background port-forward, deletes the `treeward-quickstart` Kind cluste
   make status
   make logs
   ```
-- **401 Unauthorized after changing secrets:** Re-run `make quickstart` with the new `TREEWARD_BOOTSTRAP_TOKEN` / `TREEWARD_LOCAL_TOKEN`; quickstart detects the secret change, restarts the workloads automatically, and mints a fresh operator token.
+- **401 Unauthorized after changing secrets:** Re-run `make quickstart` with the new `TREEWARD_ENROLL_TOKEN` / `TREEWARD_ADMIN_BOOTSTRAP_TOKEN` / `TREEWARD_LOCAL_TOKEN`; quickstart detects the secret change, restarts the workloads automatically, and mints a fresh operator token.
 
 ## Pause on hard fail
 

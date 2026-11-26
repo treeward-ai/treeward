@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"flag"
 	"log"
 	"net/http"
@@ -21,9 +22,16 @@ func main() {
 	flag.Parse()
 
 	addr := env("TREEWARD_ADDR", ":8080")
-	bootstrap := os.Getenv("TREEWARD_BOOTSTRAP_TOKEN")
-	if bootstrap == "" {
-		log.Fatal("TREEWARD_BOOTSTRAP_TOKEN is required")
+	enrollToken := os.Getenv("TREEWARD_ENROLL_TOKEN")
+	if enrollToken == "" {
+		log.Fatal("TREEWARD_ENROLL_TOKEN is required")
+	}
+	adminBootstrapToken := os.Getenv("TREEWARD_ADMIN_BOOTSTRAP_TOKEN")
+	if adminBootstrapToken == "" {
+		log.Fatal("TREEWARD_ADMIN_BOOTSTRAP_TOKEN is required")
+	}
+	if subtle.ConstantTimeCompare([]byte(enrollToken), []byte(adminBootstrapToken)) == 1 {
+		log.Fatal("TREEWARD_ENROLL_TOKEN and TREEWARD_ADMIN_BOOTSTRAP_TOKEN must be distinct secrets")
 	}
 	keyDir := env("TREEWARD_KEY_DIR", "/var/treeward/keys")
 	dataDir := env("TREEWARD_DATA_DIR", "/var/treeward/data")
@@ -35,7 +43,7 @@ func main() {
 	log.Printf("local signer pubkey=%s", sig.PublicKeyHex())
 
 	dbPath := filepath.Join(dataDir, "treeward.db")
-	st, err := store.Open(dbPath, bootstrap, sig)
+	st, err := store.Open(dbPath, enrollToken, adminBootstrapToken, sig)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
