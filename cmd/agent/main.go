@@ -17,6 +17,8 @@ import (
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
+var httpClient = &http.Client{Timeout: 15 * time.Second}
+
 // Node agent: poll connector desired state → verify signed tree (when pinned) →
 // runtime.Apply → report → poll attest → runtime.Attest → submit.
 // Backend selected via --runtime or TREEWARD_RUNTIME.
@@ -122,7 +124,7 @@ func getDesired(connector, localToken string) (types.DesiredState, error) {
 		return out, err
 	}
 	setBearerAuth(req, localToken)
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return out, err
 	}
@@ -141,7 +143,7 @@ func getPendingAttest(connector, localToken string) (*types.PendingAttest, error
 		return nil, err
 	}
 	setBearerAuth(req, localToken)
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +178,7 @@ func postJSON(url, localToken string, body any) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	setBearerAuth(req, localToken)
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}

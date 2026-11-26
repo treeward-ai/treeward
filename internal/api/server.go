@@ -5,12 +5,15 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/treeward-ai/treeward/internal/store"
 	"github.com/treeward-ai/treeward/internal/types"
 )
+
+const maxJSONBodyBytes = 4 << 20 // 4 MiB
 
 type ctxKeyOperatorToken struct{}
 type ctxKeyConnector struct{}
@@ -119,8 +122,7 @@ func actorFromRequest(r *http.Request, fallback string) string {
 
 func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	var req types.CreateTokenRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	resp, err := s.Store.CreateToken(req.Name, req.ExpiresAt)
@@ -165,8 +167,7 @@ func (s *Server) withConnector(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req types.EnrollRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	resp, err := s.Store.Enroll(req)
@@ -184,8 +185,7 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req types.InventoryUpsert
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.ClusterID != "" && req.ClusterID != conn.ClusterID {
@@ -219,8 +219,7 @@ func (s *Server) handleAgentReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var reports []types.AgentReport
-	if err := json.NewDecoder(r.Body).Decode(&reports); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &reports) {
 		return
 	}
 	if err := s.Store.ProcessAgentReportsForCluster(reports, conn.ClusterID); err != nil {
@@ -240,8 +239,7 @@ func (s *Server) handleListNodes(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleCreateArtifact(w http.ResponseWriter, r *http.Request) {
 	var a types.Artifact
-	if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &a) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, s.Store.CreateArtifact(a))
@@ -253,8 +251,7 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	var b types.Binding
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &b) {
 		return
 	}
 	out, err := s.Store.CreateBinding(b)
@@ -280,7 +277,9 @@ func (s *Server) handleGetBinding(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
 	b, err := s.Store.Approve(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -291,7 +290,9 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
 	b, err := s.Store.Canary(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -302,7 +303,9 @@ func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
 	b, err := s.Store.Promote(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -313,7 +316,9 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req types.ApproveRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
 	b, err := s.Store.Revert(r.PathValue("id"), actorFromRequest(r, req.Actor))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -363,8 +368,7 @@ func (s *Server) handleAttestResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var results []types.AttestResult
-	if err := json.NewDecoder(r.Body).Decode(&results); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &results) {
 		return
 	}
 	// Never trust client-supplied verdict fields.
@@ -403,6 +407,37 @@ func (s *Server) handleAttestResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, c)
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return false
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return false
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

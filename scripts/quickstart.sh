@@ -201,35 +201,19 @@ deploy_manifests() {
   prev_admin_bootstrap_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-admin-bootstrap -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
   prev_local_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-local -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"
 
-  # Apply secrets via stdin so token values never appear in stdout or process args.
-  kubectl --context "$CONTEXT" apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: treeward-enroll
-  namespace: ${NAMESPACE}
-type: Opaque
-stringData:
-  token: "${ENROLL_TOKEN}"
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: treeward-admin-bootstrap
-  namespace: ${NAMESPACE}
-type: Opaque
-stringData:
-  token: "${ADMIN_BOOTSTRAP_TOKEN}"
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: treeward-local
-  namespace: ${NAMESPACE}
-type: Opaque
-stringData:
-  token: "${LOCAL_TOKEN}"
-EOF
+  # Apply secrets via stdin so token values never appear in process args or YAML interpolation.
+  printf '%s' "$ENROLL_TOKEN" \
+    | kubectl --context "$CONTEXT" -n "$NAMESPACE" create secret generic treeward-enroll \
+        --from-file=token=/dev/stdin --dry-run=client -o yaml \
+    | kubectl --context "$CONTEXT" apply -f - >/dev/null
+  printf '%s' "$ADMIN_BOOTSTRAP_TOKEN" \
+    | kubectl --context "$CONTEXT" -n "$NAMESPACE" create secret generic treeward-admin-bootstrap \
+        --from-file=token=/dev/stdin --dry-run=client -o yaml \
+    | kubectl --context "$CONTEXT" apply -f - >/dev/null
+  printf '%s' "$LOCAL_TOKEN" \
+    | kubectl --context "$CONTEXT" -n "$NAMESPACE" create secret generic treeward-local \
+        --from-file=token=/dev/stdin --dry-run=client -o yaml \
+    | kubectl --context "$CONTEXT" apply -f - >/dev/null
 
   local new_enroll_rv new_admin_bootstrap_rv new_local_rv
   new_enroll_rv="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get secret treeward-enroll -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true)"

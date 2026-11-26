@@ -13,6 +13,8 @@ import (
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -282,7 +284,7 @@ func doRequest(method, url string, body any, bearer string, out any) {
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		fatal(err)
 	}

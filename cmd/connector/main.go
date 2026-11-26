@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,10 @@ import (
 
 	"github.com/treeward-ai/treeward/internal/types"
 )
+
+const maxLocalBodyBytes = 4 << 20 // 4 MiB
+
+var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // Connector sits between node agents and the Treeward API.
 // Agents POST inventory/status here; connector enrolls and phones home.
@@ -65,8 +70,7 @@ func main() {
 
 	mux.HandleFunc("POST /v1/local/report", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
 		var reports []types.AgentReport
-		if err := json.NewDecoder(r.Body).Decode(&reports); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !decodeLocalJSON(w, r, &reports) {
 			return
 		}
 		_, cid := creds.snapshot()
@@ -112,8 +116,7 @@ func main() {
 
 	mux.HandleFunc("POST /v1/local/attest", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
 		var results []types.AttestResult
-		if err := json.NewDecoder(r.Body).Decode(&results); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !decodeLocalJSON(w, r, &results) {
 			return
 		}
 		mu.Lock()
@@ -248,8 +251,29 @@ func main() {
 		}
 	}()
 
+	httpSrv := &http.Server{
+		Addr:              listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	tlsCert := os.Getenv("TREEWARD_TLS_CERT")
+	tlsKey := os.Getenv("TREEWARD_TLS_KEY")
+	if (tlsCert == "") != (tlsKey == "") {
+		log.Fatal("TREEWARD_TLS_CERT and TREEWARD_TLS_KEY must both be set to enable TLS")
+	}
+	if tlsCert != "" {
+		httpSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+		log.Printf("connector listening on %s (TLS 1.3) → %s", listen, apiURL)
+		log.Fatal(httpSrv.ListenAndServeTLS(tlsCert, tlsKey))
+	}
+
 	log.Printf("connector listening on %s → %s", listen, apiURL)
-	log.Fatal(http.ListenAndServe(listen, mux))
+	log.Fatal(httpSrv.ListenAndServe())
 }
 
 type credManager struct {
@@ -405,7 +429,7 @@ func getActiveAttest(apiURL, token string) (*types.PendingAttest, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -441,7 +465,7 @@ func postJSON(url, token string, body any, out any) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -464,7 +488,7 @@ func getJSON(url, token string, out any) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -503,6 +527,20 @@ func isAuthRejected(err error) bool {
 		return he.code == http.StatusUnauthorized || he.code == http.StatusForbidden
 	}
 	return false
+}
+
+func decodeLocalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxLocalBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return false
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

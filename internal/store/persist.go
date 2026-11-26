@@ -26,7 +26,7 @@ type snapshot struct {
 
 // Open loads (or creates) a SQLite-backed store at dbPath.
 func Open(dbPath, enrollToken, adminBootstrapToken string, sig signer.Signer) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, err
 	}
 	db, err := sql.Open("sqlite", dbPath)
@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );`); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if _, err := os.Stat(dbPath); err == nil {
+		_ = os.Chmod(dbPath, 0o600)
 	}
 
 	s := &Store{
@@ -135,6 +138,7 @@ func (s *Store) persistLocked() {
 	}
 	raw, err := json.Marshal(snap)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "treeward persist marshal: %v\n", err)
 		return
 	}
 	_, err = s.db.Exec(
