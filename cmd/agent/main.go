@@ -17,7 +17,14 @@ import (
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+const maxResponseBodyBytes = 4 << 20 // 4 MiB
+
+var httpClient = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 // Node agent: poll connector desired state → verify signed tree (when pinned) →
 // runtime.Apply → report → poll attest → runtime.Attest → submit.
@@ -140,7 +147,10 @@ func getDesired(connector, localToken string) (types.DesiredState, error) {
 		return out, err
 	}
 	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
+	data, err := readBodyBounded(res.Body, maxResponseBodyBytes)
+	if err != nil {
+		return out, err
+	}
 	if res.StatusCode >= 300 {
 		return out, &httpError{res.StatusCode, string(data)}
 	}
@@ -162,7 +172,10 @@ func getPendingAttest(connector, localToken string) (*types.PendingAttest, error
 	if res.StatusCode == http.StatusNoContent {
 		return nil, nil
 	}
-	data, _ := io.ReadAll(res.Body)
+	data, err := readBodyBounded(res.Body, maxResponseBodyBytes)
+	if err != nil {
+		return nil, err
+	}
 	if res.StatusCode >= 300 {
 		return nil, &httpError{res.StatusCode, string(data)}
 	}
@@ -195,10 +208,24 @@ func postJSON(url, localToken string, body any) error {
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
-		data, _ := io.ReadAll(res.Body)
+		data, err := readBodyBounded(res.Body, maxResponseBodyBytes)
+		if err != nil {
+			return &httpError{res.StatusCode, err.Error()}
+		}
 		return &httpError{res.StatusCode, string(data)}
 	}
 	return nil
+}
+
+func readBodyBounded(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", limit)
+	}
+	return data, nil
 }
 
 func setBearerAuth(req *http.Request, token string) {
