@@ -1,7 +1,11 @@
 package runtime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +14,11 @@ import (
 
 	"github.com/treeward-ai/treeward/internal/types"
 )
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
 
 func writeFakeShirudo(t *testing.T, script string) (binPath, logPath string) {
 	t.Helper()
@@ -115,7 +124,7 @@ exit 1
 	upatchDir := t.TempDir()
 	stateDir := t.TempDir()
 
-	// Seed owned state and signed unload directive for old-patch.
+	// Seed owned state (legacy string list) and signed unload directive for old-patch.
 	if err := os.WriteFile(filepath.Join(stateDir, "owned.json"), []byte(`["old-patch","keep-patch"]`), 0o644); err != nil {
 		t.Fatalf("write owned.json: %v", err)
 	}
@@ -123,6 +132,13 @@ exit 1
 	if err := os.WriteFile(directivePath, []byte("signed-unload-directive"), 0o644); err != nil {
 		t.Fatalf("write unload directive: %v", err)
 	}
+	newPayload := []byte("signed-new-patch-bytes")
+	newSHA := sha256Hex(newPayload)
+	newPath := filepath.Join(upatchDir, "new-patch.upatch")
+	if err := os.WriteFile(newPath, newPayload, 0o644); err != nil {
+		t.Fatalf("write new-patch.upatch: %v", err)
+	}
+	keepSHA := sha256Hex([]byte("keep-patch-bytes"))
 
 	rt := NewShirudo(
 		WithShirudoBin(bin),
@@ -133,7 +149,10 @@ exit 1
 
 	desired := types.DesiredState{
 		Nodes: map[string][]string{
-			"node-1": {"keep-patch", "new-patch"},
+			"node-1": {
+				"keep-patch@sha256:" + keepSHA,
+				"new-patch@sha256:" + newSHA,
+			},
 		},
 	}
 
@@ -152,7 +171,7 @@ exit 1
 	calls := readCallLog(t, logPath)
 	wantCalls := []string{
 		"status --json",
-		"upatch load " + filepath.Join(upatchDir, "new-patch"),
+		"upatch load " + newPath,
 		"upatch unload " + directivePath,
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
@@ -286,6 +305,12 @@ exit 1
 
 	upatchDir := t.TempDir()
 	stateDir := t.TempDir()
+	managedPayload := []byte("signed-managed-patch")
+	managedSHA := sha256Hex(managedPayload)
+	managedPath := filepath.Join(upatchDir, "managed-patch.upatch")
+	if err := os.WriteFile(managedPath, managedPayload, 0o644); err != nil {
+		t.Fatalf("write managed-patch.upatch: %v", err)
+	}
 	directivePath := filepath.Join(upatchDir, "managed-patch.unload.upatch")
 	if err := os.WriteFile(directivePath, []byte("signed-unload-directive"), 0o644); err != nil {
 		t.Fatalf("write directive: %v", err)
@@ -299,7 +324,7 @@ exit 1
 		WithStateDir(stateDir),
 	)
 	loaded, errs, err := rt1.Apply(types.DesiredState{
-		Nodes: map[string][]string{"node-1": {"managed-patch"}},
+		Nodes: map[string][]string{"node-1": {"managed-patch@sha256:" + managedSHA}},
 	})
 	if err != nil {
 		t.Fatalf("cycle 1 Apply() error: %v", err)
@@ -334,7 +359,7 @@ exit 1
 	calls := readCallLog(t, logPath)
 	wantCalls := []string{
 		"status --json",
-		"upatch load " + filepath.Join(upatchDir, "managed-patch"),
+		"upatch load " + managedPath,
 		"status --json",
 		"upatch unload " + directivePath,
 	}
@@ -360,9 +385,16 @@ esac
 exit 1
 `)
 
-	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithStateDir(t.TempDir()))
+	upatchDir := t.TempDir()
+	badPayload := []byte("bad-sig-payload")
+	badSHA := sha256Hex(badPayload)
+	if err := os.WriteFile(filepath.Join(upatchDir, "bad-patch.upatch"), badPayload, 0o644); err != nil {
+		t.Fatalf("write bad-patch.upatch: %v", err)
+	}
+
+	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithUpatchDir(upatchDir), WithStateDir(t.TempDir()))
 	loaded, errs, err := rt.Apply(types.DesiredState{
-		Nodes: map[string][]string{"node-1": {"bad-patch"}},
+		Nodes: map[string][]string{"node-1": {"bad-patch@sha256:" + badSHA}},
 	})
 	if err != nil {
 		t.Fatalf("Apply() returned top-level error: %v", err)
@@ -522,8 +554,14 @@ esac
 exit 1
 `)
 	stateDir := filepath.Join(t.TempDir(), "state")
-	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithStateDir(stateDir))
-	if _, _, err := rt.Apply(types.DesiredState{Nodes: map[string][]string{"node-1": {"patch-a"}}}); err != nil {
+	upatchDir := t.TempDir()
+	payload := []byte("patch-a-bytes")
+	patchSHA := sha256Hex(payload)
+	if err := os.WriteFile(filepath.Join(upatchDir, "patch-a.upatch"), payload, 0o644); err != nil {
+		t.Fatalf("write patch-a.upatch: %v", err)
+	}
+	rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-1"), WithUpatchDir(upatchDir), WithStateDir(stateDir))
+	if _, _, err := rt.Apply(types.DesiredState{Nodes: map[string][]string{"node-1": {"patch-a@sha256:" + patchSHA}}}); err != nil {
 		t.Fatalf("Apply() error: %v", err)
 	}
 
@@ -618,4 +656,349 @@ exit 1
 			t.Fatalf("label %s = %q, want %q", types.LabelRollout, got, types.RolloutCanary)
 		}
 	})
+}
+
+func TestParseDesiredUpatch(t *testing.T) {
+	validHex := "cda9fc07e4acdbabd07acd6e439499db51a3968f147630eb09a71f96dc405c7f"
+	upperHex := strings.ToUpper(validHex)
+
+	t.Run("valid", func(t *testing.T) {
+		spec, err := ParseDesiredUpatch("app-sandbox@sha256:" + validHex)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if spec.Name != "app-sandbox" || spec.SHA256 != validHex {
+			t.Fatalf("got %+v, want name=app-sandbox sha=%s", spec, validHex)
+		}
+	})
+
+	t.Run("valid uppercase hex normalized", func(t *testing.T) {
+		spec, err := ParseDesiredUpatch("app-sandbox@sha256:" + upperHex)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if spec.SHA256 != validHex {
+			t.Fatalf("got sha=%q, want lowercase %q", spec.SHA256, validHex)
+		}
+	})
+
+	badCases := []struct {
+		name  string
+		input string
+	}{
+		{"empty", ""},
+		{"legacy plain digest", "sha256:" + validHex},
+		{"bare name", "app-sandbox"},
+		{"bare artifact id", "art_c5b7c4a8d19d41b9"},
+		{"missing sha256 prefix", "app-sandbox@" + validHex},
+		{"bad name traversal", "../evil@sha256:" + validHex},
+		{"bad name leading dash", "-evil@sha256:" + validHex},
+		{"bad name slash", "a/b@sha256:" + validHex},
+		{"bad name space", "app sandbox@sha256:" + validHex},
+		{"empty name", "@sha256:" + validHex},
+		{"short sha", "app-sandbox@sha256:abcd"},
+		{"long sha", "app-sandbox@sha256:" + validHex + "00"},
+		{"non-hex sha", "app-sandbox@sha256:" + strings.Repeat("z", 64)},
+		{"extra at", "app@sandbox@sha256:" + validHex},
+	}
+
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if spec, err := ParseDesiredUpatch(tc.input); err == nil {
+				t.Fatalf("ParseDesiredUpatch(%q) = %+v, want error", tc.input, spec)
+			}
+		})
+	}
+}
+
+func TestShirudoDownloadAndVerify(t *testing.T) {
+	goodPayload := []byte("valid-signed-upatch-payload-bytes")
+	goodSHA := sha256Hex(goodPayload)
+	badSHA := strings.Repeat("a", 64)
+	missingSHA := strings.Repeat("b", 64)
+
+	var gotAuth string
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		gotAuth = r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case "/v1/upatches/" + goodSHA:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("x-upatch-sha256", goodSHA)
+			_, _ = w.Write(goodPayload)
+		case "/v1/upatches/" + badSHA:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("corrupted-bytes"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bin, logPath := writeFakeShirudo(t, `
+case "$1" in
+  status)
+    echo '{"status":"ok","upatches_loaded":[]}'
+    exit 0
+    ;;
+  upatch)
+    if [ "$2" = "load" ] && [ -n "$3" ]; then
+      exit 0
+    fi
+    ;;
+esac
+echo "unexpected args: $@" >&2
+exit 1
+`)
+
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+	rt := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+		WithConnectorURL(srv.URL),
+		WithLocalToken("test-local-token"),
+	)
+
+	desired := types.DesiredState{
+		Nodes: map[string][]string{
+			"node-1": {
+				"app-sandbox@sha256:" + goodSHA,
+				"bad-sha@sha256:" + badSHA,
+				"missing-patch@sha256:" + missingSHA,
+				"sha256:" + goodSHA, // legacy plain digest rejected
+			},
+		},
+	}
+
+	loaded, errs, err := rt.Apply(desired)
+	if err != nil {
+		t.Fatalf("Apply() top-level error: %v", err)
+	}
+	if gotAuth != "Bearer test-local-token" {
+		t.Fatalf("Authorization = %q, want Bearer test-local-token", gotAuth)
+	}
+	if !reflect.DeepEqual(loaded["node-1"], []string{"app-sandbox"}) {
+		t.Fatalf("loaded[node-1] = %v, want [app-sandbox]", loaded["node-1"])
+	}
+	if len(errs["node-1"]) != 3 {
+		t.Fatalf("len(errs[node-1]) = %d, want 3 (errs=%v)", len(errs["node-1"]), errs["node-1"])
+	}
+
+	// Verify good file exists with 0644 and matching contents.
+	goodPath := filepath.Join(upatchDir, "app-sandbox.upatch")
+	info, err := os.Stat(goodPath)
+	if err != nil {
+		t.Fatalf("stat %q: %v", goodPath, err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Fatalf("perm = %o, want 644", perm)
+	}
+	b, err := os.ReadFile(goodPath)
+	if err != nil || string(b) != string(goodPayload) {
+		t.Fatalf("read %q = %q (%v), want %q", goodPath, string(b), err, string(goodPayload))
+	}
+
+	// Verify no temp files were left behind on bad sha / 404.
+	entries, err := os.ReadDir(upatchDir)
+	if err != nil {
+		t.Fatalf("readdir %q: %v", upatchDir, err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "app-sandbox.upatch" {
+		t.Fatalf("unexpected files in upatchDir: %v", entries)
+	}
+
+	// Verify only app-sandbox was loaded via shirudo-runtime.
+	calls := readCallLog(t, logPath)
+	wantCalls := []string{
+		"status --json",
+		"upatch load " + goodPath,
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v", calls, wantCalls)
+	}
+
+	// Verify owned.json persisted as JSON object with name -> sha.
+	ownedBytes, err := os.ReadFile(filepath.Join(stateDir, "owned.json"))
+	if err != nil {
+		t.Fatalf("read owned.json: %v", err)
+	}
+	var ownedMap map[string]string
+	if err := json.Unmarshal(ownedBytes, &ownedMap); err != nil {
+		t.Fatalf("unmarshal owned.json: %v (%s)", err, string(ownedBytes))
+	}
+	if ownedMap["app-sandbox"] != goodSHA {
+		t.Fatalf("owned[app-sandbox] = %q, want %q", ownedMap["app-sandbox"], goodSHA)
+	}
+
+	// Second call with cached file should not hit HTTP again.
+	hitsBefore := hits
+	if err := rt.ensureUpatchFile(goodPath, goodSHA); err != nil {
+		t.Fatalf("ensureUpatchFile cached error: %v", err)
+	}
+	if hits != hitsBefore {
+		t.Fatalf("expected cached file to skip HTTP download, hits %d -> %d", hitsBefore, hits)
+	}
+}
+
+func TestShirudoUnloadDirectiveDownload(t *testing.T) {
+	payloadSHA := sha256Hex([]byte("original-payload"))
+	unloadBytes := []byte("signed-unload-directive-bytes")
+	unloadSHA := sha256Hex(unloadBytes)
+
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		if r.URL.Path == "/v1/upatches/"+payloadSHA+"/unload" {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("x-upatch-sha256", unloadSHA)
+			_, _ = w.Write(unloadBytes)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	bin, logPath := writeFakeShirudo(t, `
+case "$1" in
+  status)
+    echo '{"status":"ok","upatches_loaded":["app-sandbox"]}'
+    exit 0
+    ;;
+  upatch)
+    if [ "$2" = "unload" ] && [ -n "$3" ]; then
+      exit 0
+    fi
+    ;;
+esac
+echo "unexpected args: $@" >&2
+exit 1
+`)
+
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+	ownedJSON, _ := json.Marshal(map[string]string{"app-sandbox": payloadSHA})
+	if err := os.WriteFile(filepath.Join(stateDir, "owned.json"), ownedJSON, 0o600); err != nil {
+		t.Fatalf("write owned.json: %v", err)
+	}
+
+	rt := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+		WithConnectorURL(srv.URL),
+		WithLocalToken("unload-token"),
+	)
+
+	loaded, errs, err := rt.Apply(types.DesiredState{
+		Nodes: map[string][]string{"node-1": {}},
+	})
+	if err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("Apply() errs = %v, want empty", errs)
+	}
+	if len(loaded["node-1"]) != 0 {
+		t.Fatalf("loaded[node-1] = %v, want empty", loaded["node-1"])
+	}
+	if gotPath != "/v1/upatches/"+payloadSHA+"/unload" {
+		t.Fatalf("download path = %q, want /v1/upatches/%s/unload", gotPath, payloadSHA)
+	}
+	if gotAuth != "Bearer unload-token" {
+		t.Fatalf("Authorization = %q, want Bearer unload-token", gotAuth)
+	}
+
+	directivePath := filepath.Join(upatchDir, "app-sandbox.unload.upatch")
+	calls := readCallLog(t, logPath)
+	wantCalls := []string{
+		"status --json",
+		"upatch unload " + directivePath,
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %v, want %v", calls, wantCalls)
+	}
+}
+
+func TestShirudoOwnedStateMigration(t *testing.T) {
+	var httpHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpHits++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	bin, logPath := writeFakeShirudo(t, `
+case "$1" in
+  status)
+    echo '{"status":"ok","upatches_loaded":["legacy-patch","keep-patch"]}'
+    exit 0
+    ;;
+  upatch)
+    echo "should not be called" >&2
+    exit 1
+    ;;
+esac
+exit 1
+`)
+
+	upatchDir := t.TempDir()
+	stateDir := t.TempDir()
+	// Legacy string-list owned.json
+	if err := os.WriteFile(filepath.Join(stateDir, "owned.json"), []byte(`["legacy-patch","keep-patch"]`), 0o600); err != nil {
+		t.Fatalf("write legacy owned.json: %v", err)
+	}
+
+	keepSHA := sha256Hex([]byte("keep-patch"))
+	rt := NewShirudo(
+		WithShirudoBin(bin),
+		WithNodeID("node-1"),
+		WithUpatchDir(upatchDir),
+		WithStateDir(stateDir),
+		WithConnectorURL(srv.URL),
+	)
+
+	loaded, errs, err := rt.Apply(types.DesiredState{
+		Nodes: map[string][]string{
+			"node-1": {"keep-patch@sha256:" + keepSHA},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if httpHits != 0 {
+		t.Fatalf("expected 0 HTTP hits for legacy entry without sha, got %d", httpHits)
+	}
+	if len(errs["node-1"]) != 1 || !strings.Contains(errs["node-1"][0], "no recorded sha256") {
+		t.Fatalf("errs[node-1] = %v, want no recorded sha256 error", errs["node-1"])
+	}
+	if !reflect.DeepEqual(loaded["node-1"], []string{"keep-patch", "legacy-patch"}) {
+		t.Fatalf("loaded[node-1] = %v, want [keep-patch legacy-patch]", loaded["node-1"])
+	}
+
+	// Verify owned.json was migrated to JSON object format.
+	ownedBytes, err := os.ReadFile(filepath.Join(stateDir, "owned.json"))
+	if err != nil {
+		t.Fatalf("read owned.json: %v", err)
+	}
+	var ownedMap map[string]string
+	if err := json.Unmarshal(ownedBytes, &ownedMap); err != nil {
+		t.Fatalf("unmarshal migrated owned.json: %v (%s)", err, string(ownedBytes))
+	}
+	if ownedMap["keep-patch"] != keepSHA {
+		t.Fatalf("owned[keep-patch] = %q, want %q", ownedMap["keep-patch"], keepSHA)
+	}
+	if sha, ok := ownedMap["legacy-patch"]; !ok || sha != "" {
+		t.Fatalf("owned[legacy-patch] = (%q, %v), want (\"\", true)", sha, ok)
+	}
+
+	calls := readCallLog(t, logPath)
+	if !reflect.DeepEqual(calls, []string{"status --json"}) {
+		t.Fatalf("calls = %v, want [status --json]", calls)
+	}
 }
