@@ -37,9 +37,17 @@ func main() {
 		log.Printf("%s", verifyWarning)
 	}
 
-	rt, err := runtime.New(kind)
-	if err != nil {
-		log.Fatalf("runtime: %v", err)
+	var rt runtime.Runtime
+	if strings.EqualFold(strings.TrimSpace(kind), "shirudo") {
+		rt = runtime.NewShirudo(
+			runtime.WithConnectorURL(connector),
+			runtime.WithLocalToken(localToken),
+		)
+	} else {
+		rt, err = runtime.New(kind)
+		if err != nil {
+			log.Fatalf("runtime: %v", err)
+		}
 	}
 	interval := 3 * time.Second
 

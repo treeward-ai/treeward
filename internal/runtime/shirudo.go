@@ -2,9 +2,13 @@ package runtime
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +16,7 @@ import (
 	goruntime "runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/treeward-ai/treeward/internal/types"
 )
@@ -19,6 +24,7 @@ import (
 var (
 	upatchNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 	hexNonceRe   = regexp.MustCompile(`^[0-9a-fA-F]{16,128}$`)
+	sha256HexRe  = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 )
 
 // DefaultShirudoBin is the default path to the shirudo-runtime CLI.
@@ -28,9 +34,43 @@ const DefaultShirudoBin = "/usr/local/bin/shirudo-runtime"
 const DefaultShirudoStateDir = "/var/lib/treeward-agent"
 
 const (
-	ownedStateFilename    = "owned.json"
-	unloadDirectiveSuffix = ".unload.upatch"
+	ownedStateFilename     = "owned.json"
+	upatchFileSuffix       = ".upatch"
+	unloadDirectiveSuffix  = ".unload.upatch"
+	defaultDownloadTimeout = 60 * time.Second
+	maxUpatchDownloadBytes = 16 << 20 // 16 MiB
 )
+
+// UpatchSpec is a parsed desired upatch entry of the form "<name>@sha256:<64-hex>".
+type UpatchSpec struct {
+	Name   string
+	SHA256 string // lowercase 64-hex
+}
+
+// ParseDesiredUpatch parses a desired upatch entry of the form "<name>@sha256:<64-hex>".
+// Legacy plain digests (without '@') and malformed entries are rejected.
+func ParseDesiredUpatch(entry string) (UpatchSpec, error) {
+	idx := strings.IndexByte(entry, '@')
+	if idx < 0 {
+		return UpatchSpec{}, fmt.Errorf("invalid desired upatch %q: expected <name>@sha256:<64-hex>", entry)
+	}
+	name := entry[:idx]
+	rest := entry[idx+1:]
+	if err := validateUpatchName(name); err != nil {
+		return UpatchSpec{}, fmt.Errorf("invalid desired upatch %q: %w", entry, err)
+	}
+	if !strings.HasPrefix(rest, "sha256:") {
+		return UpatchSpec{}, fmt.Errorf("invalid desired upatch %q: missing sha256: prefix", entry)
+	}
+	digest := strings.TrimPrefix(rest, "sha256:")
+	if !sha256HexRe.MatchString(digest) {
+		return UpatchSpec{}, fmt.Errorf("invalid desired upatch %q: sha256 must be 64 hex chars", entry)
+	}
+	return UpatchSpec{
+		Name:   name,
+		SHA256: strings.ToLower(digest),
+	}, nil
+}
 
 // ShirudoStatus represents the JSON output of `shirudo-runtime status --json`.
 type ShirudoStatus struct {
@@ -136,6 +176,29 @@ func WithRollout(rollout string) ShirudoOption {
 	}
 }
 
+// WithConnectorURL sets the base URL used to download upatch payloads and unload directives.
+func WithConnectorURL(url string) ShirudoOption {
+	return func(s *ShirudoRuntime) {
+		s.connectorURL = strings.TrimRight(strings.TrimSpace(url), "/")
+	}
+}
+
+// WithLocalToken sets the bearer token used when authenticating to the connector.
+func WithLocalToken(token string) ShirudoOption {
+	return func(s *ShirudoRuntime) {
+		s.localToken = token
+	}
+}
+
+// WithHTTPClient overrides the HTTP client used for upatch downloads.
+func WithHTTPClient(client *http.Client) ShirudoOption {
+	return func(s *ShirudoRuntime) {
+		if client != nil {
+			s.httpClient = client
+		}
+	}
+}
+
 // ShirudoRuntime implements Runtime by shelling out to the shirudo-runtime CLI.
 //
 // Revert / unload convention: the operator builds a signed UNLOAD directive
@@ -144,7 +207,8 @@ func WithRollout(rollout string) ShirudoOption {
 // to `shirudo-runtime upatch unload <path>`.
 //
 // Ownership: Apply tracks upatches that appeared in a Treeward desired set in
-// <stateDir>/owned.json (SHIRUDO_STATE_DIR, default /var/lib/treeward-agent).
+// <stateDir>/owned.json (SHIRUDO_STATE_DIR, default /var/lib/treeward-agent)
+// as a JSON object mapping upatch name -> payload sha256.
 // Externally loaded upatches not present in owned.json are never unloaded.
 type ShirudoRuntime struct {
 	bin            string
@@ -153,14 +217,17 @@ type ShirudoRuntime struct {
 	upatchDir      string
 	stateDir       string
 	rollout        string
+	connectorURL   string
+	localToken     string
+	httpClient     *http.Client
 	ownedLoaded    bool
-	owned          map[string]bool
+	owned          map[string]string
 	loggedExternal map[string]bool
 }
 
 // NewShirudo constructs a ShirudoRuntime configured from environment variables
 // (SHIRUDO_RUNTIME_BIN, NODE_NAME/HOSTNAME, SHIRUDO_UPATCH_DIR, SHIRUDO_STATE_DIR,
-// TREEWARD_ROLLOUT) and optional overrides.
+// TREEWARD_ROLLOUT, TREEWARD_CONNECTOR_URL, TREEWARD_LOCAL_TOKEN) and optional overrides.
 func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 	host, _ := os.Hostname()
 	hostname := env("NODE_NAME", env("HOSTNAME", host))
@@ -175,7 +242,10 @@ func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 		upatchDir:      env("SHIRUDO_UPATCH_DIR", ""),
 		stateDir:       env("SHIRUDO_STATE_DIR", DefaultShirudoStateDir),
 		rollout:        strings.TrimSpace(os.Getenv("TREEWARD_ROLLOUT")),
-		owned:          map[string]bool{},
+		connectorURL:   strings.TrimRight(strings.TrimSpace(os.Getenv("TREEWARD_CONNECTOR_URL")), "/"),
+		localToken:     os.Getenv("TREEWARD_LOCAL_TOKEN"),
+		httpClient:     &http.Client{Timeout: defaultDownloadTimeout},
+		owned:          map[string]string{},
 		loggedExternal: map[string]bool{},
 	}
 	for _, opt := range opts {
@@ -241,10 +311,11 @@ func (s *ShirudoRuntime) resolveUpatchPath(name string) (string, error) {
 	if err := validateUpatchName(name); err != nil {
 		return "", err
 	}
+	filename := name + upatchFileSuffix
 	if s.upatchDir == "" {
-		return name, nil
+		return filename, nil
 	}
-	return resolvePathWithinBase(s.upatchDir, name)
+	return resolvePathWithinBase(s.upatchDir, filename)
 }
 
 func (s *ShirudoRuntime) resolveUnloadDirectivePath(name string) (string, error) {
@@ -370,34 +441,42 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 
 	want := desired.Nodes[s.nodeID]
 	wantSet := make(map[string]struct{}, len(want))
+	specs := make([]UpatchSpec, 0, len(want))
+	var nodeErrs []string
+
 	for _, d := range want {
-		if validateUpatchName(d) != nil {
+		spec, err := ParseDesiredUpatch(d)
+		if err != nil {
+			nodeErrs = append(nodeErrs, fmt.Sprintf("shirudo upatch load %q: %v", d, err))
 			continue
 		}
-		wantSet[d] = struct{}{}
-		if !s.owned[d] {
-			s.owned[d] = true
+		wantSet[spec.Name] = struct{}{}
+		specs = append(specs, spec)
+		if prevSHA, ok := s.owned[spec.Name]; !ok || prevSHA != spec.SHA256 {
+			s.owned[spec.Name] = spec.SHA256
 			ownedDirty = true
 		}
 	}
 
-	var nodeErrs []string
-
 	// Load desired upatches that are not yet loaded.
-	for _, d := range want {
-		if _, ok := currentSet[d]; ok {
+	for _, spec := range specs {
+		if _, ok := currentSet[spec.Name]; ok {
 			continue
 		}
-		path, err := s.resolveUpatchPath(d)
+		path, err := s.resolveUpatchPath(spec.Name)
 		if err != nil {
-			nodeErrs = append(nodeErrs, fmt.Sprintf("shirudo upatch load %q: %v", d, err))
+			nodeErrs = append(nodeErrs, fmt.Sprintf("shirudo upatch load %q: %v", spec.Name, err))
+			continue
+		}
+		if err := s.ensureUpatchFile(path, spec.SHA256); err != nil {
+			nodeErrs = append(nodeErrs, fmt.Sprintf("shirudo upatch load %q: %v", spec.Name, err))
 			continue
 		}
 		if err := s.LoadUpatch(path); err != nil {
 			nodeErrs = append(nodeErrs, err.Error())
 			continue
 		}
-		currentSet[d] = struct{}{}
+		currentSet[spec.Name] = struct{}{}
 	}
 
 	// Unload currently loaded upatches that are owned by Treeward and no longer desired.
@@ -405,11 +484,21 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 		if _, ok := wantSet[cur]; ok {
 			continue
 		}
-		if !s.owned[cur] {
+		recordedSHA, isOwned := s.owned[cur]
+		if !isOwned {
 			if !s.loggedExternal[cur] {
 				log.Printf("shirudo: skipping externally loaded upatch %q (not managed by treeward)", cur)
 				s.loggedExternal[cur] = true
 			}
+			continue
+		}
+		directivePath, err := s.resolveUnloadDirectivePath(cur)
+		if err != nil {
+			nodeErrs = append(nodeErrs, fmt.Sprintf("shirudo upatch unload %q: %v", cur, err))
+			continue
+		}
+		if err := s.ensureUnloadDirectiveFile(directivePath, cur, recordedSHA); err != nil {
+			nodeErrs = append(nodeErrs, err.Error())
 			continue
 		}
 		if err := s.UnloadUpatch(cur); err != nil {
@@ -441,6 +530,130 @@ func (s *ShirudoRuntime) Apply(desired types.DesiredState) (map[string][]string,
 	return loaded, errs, nil
 }
 
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (s *ShirudoRuntime) ensureUpatchFile(destPath, expectedSHA string) error {
+	if got, err := fileSHA256(destPath); err == nil && got == expectedSHA {
+		return nil
+	}
+	if s.connectorURL == "" {
+		return fmt.Errorf("upatch file %q missing or sha256 mismatch and connector URL is not configured", destPath)
+	}
+	url := fmt.Sprintf("%s/v1/upatches/%s", s.connectorURL, expectedSHA)
+	return s.downloadAndVerify(url, destPath, expectedSHA, false)
+}
+
+func (s *ShirudoRuntime) ensureUnloadDirectiveFile(directivePath, name, recordedSHA string) error {
+	if _, err := os.Stat(directivePath); err == nil {
+		return nil
+	}
+	if recordedSHA == "" {
+		return fmt.Errorf("shirudo upatch unload %q: missing unload directive %q and no recorded sha256 in owned state", name, directivePath)
+	}
+	if s.connectorURL == "" {
+		return fmt.Errorf("shirudo upatch unload %q: missing unload directive %q and connector URL is not configured", name, directivePath)
+	}
+	url := fmt.Sprintf("%s/v1/upatches/%s/unload", s.connectorURL, recordedSHA)
+	if err := s.downloadAndVerify(url, directivePath, recordedSHA, true); err != nil {
+		return fmt.Errorf("shirudo upatch unload %q: %w", name, err)
+	}
+	return nil
+}
+
+// downloadAndVerify fetches url with bearer auth, enforces maxUpatchDownloadBytes,
+// writes to a temp file in filepath.Dir(destPath), verifies sha256, chmods 0644,
+// and renames into destPath. If preferHeaderSHA is true and the server returns a
+// non-empty x-upatch-sha256 header, the response is verified against that header;
+// otherwise it is verified against fallbackSHA.
+func (s *ShirudoRuntime) downloadAndVerify(url, destPath, fallbackSHA string, preferHeaderSHA bool) error {
+	client := s.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: defaultDownloadTimeout}
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("download %s: %w", url, err)
+	}
+	if s.localToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.localToken)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("download %s: %w", url, err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
+		return fmt.Errorf("download %s: HTTP %d: %s", url, res.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	expectedSHA := strings.ToLower(strings.TrimSpace(fallbackSHA))
+	if preferHeaderSHA {
+		if hdr := strings.TrimSpace(res.Header.Get("x-upatch-sha256")); hdr != "" {
+			if !sha256HexRe.MatchString(hdr) {
+				return fmt.Errorf("download %s: invalid x-upatch-sha256 header %q", url, hdr)
+			}
+			expectedSHA = strings.ToLower(hdr)
+		}
+	}
+
+	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create upatch dir %q: %w", dir, err)
+	}
+	tmpFile, err := os.CreateTemp(dir, ".upatch-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file in %q: %w", dir, err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}
+
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(tmpFile, h), io.LimitReader(res.Body, maxUpatchDownloadBytes+1))
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("download %s: read body: %w", url, err)
+	}
+	if n > maxUpatchDownloadBytes {
+		cleanup()
+		return fmt.Errorf("download %s: response exceeds maximum size of %d bytes", url, maxUpatchDownloadBytes)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temp file %q: %w", tmpPath, err)
+	}
+
+	actualSHA := hex.EncodeToString(h.Sum(nil))
+	if expectedSHA != "" && actualSHA != expectedSHA {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("download %s: sha256 mismatch: got %s, want %s", url, actualSHA, expectedSHA)
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("chmod temp file %q: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename %q -> %q: %w", tmpPath, destPath, err)
+	}
+	return nil
+}
+
 func (s *ShirudoRuntime) ownedStatePath() string {
 	return filepath.Join(s.stateDir, ownedStateFilename)
 }
@@ -451,7 +664,7 @@ func (s *ShirudoRuntime) loadOwned() {
 	}
 	s.ownedLoaded = true
 	if s.owned == nil {
-		s.owned = map[string]bool{}
+		s.owned = map[string]string{}
 	}
 	if s.loggedExternal == nil {
 		s.loggedExternal = map[string]bool{}
@@ -466,6 +679,16 @@ func (s *ShirudoRuntime) loadOwned() {
 		}
 		return
 	}
+	var obj map[string]string
+	if err := json.Unmarshal(data, &obj); err == nil && obj != nil {
+		for name, sha := range obj {
+			if name != "" {
+				s.owned[name] = sha
+			}
+		}
+		return
+	}
+	// Transparent migration from legacy JSON string-list format.
 	var names []string
 	if err := json.Unmarshal(data, &names); err != nil {
 		log.Printf("shirudo: decode owned state %q: %v", s.ownedStatePath(), err)
@@ -473,7 +696,7 @@ func (s *ShirudoRuntime) loadOwned() {
 	}
 	for _, name := range names {
 		if name != "" {
-			s.owned[name] = true
+			s.owned[name] = ""
 		}
 	}
 }
@@ -486,14 +709,13 @@ func (s *ShirudoRuntime) saveOwned() {
 		log.Printf("shirudo: create state dir %q: %v", s.stateDir, err)
 		return
 	}
-	names := make([]string, 0, len(s.owned))
-	for name, ok := range s.owned {
-		if ok {
-			names = append(names, name)
+	out := make(map[string]string, len(s.owned))
+	for name, sha := range s.owned {
+		if name != "" {
+			out[name] = sha
 		}
 	}
-	sort.Strings(names)
-	data, err := json.Marshal(names)
+	data, err := json.Marshal(out)
 	if err != nil {
 		log.Printf("shirudo: encode owned state: %v", err)
 		return
