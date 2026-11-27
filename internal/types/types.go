@@ -9,6 +9,10 @@ import (
 const (
 	LabelRollout  = "treeward.ai/rollout"
 	RolloutCanary = "canary"
+
+	LabelTPMNvWriter           = "treeward.ai/tpm-nv-writer"
+	TPMNvWriterRSA2048Fallback = "rsa2048-fallback"
+	TPMNvWriterRSA3072         = "rsa3072"
 )
 
 const (

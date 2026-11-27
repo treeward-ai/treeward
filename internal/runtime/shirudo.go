@@ -72,14 +72,21 @@ func ParseDesiredUpatch(entry string) (UpatchSpec, error) {
 	}, nil
 }
 
+// ShirudoAssets represents the assets section of `shirudo-runtime status --json`.
+type ShirudoAssets struct {
+	Root     string `json:"root,omitempty"`
+	Eventlog bool   `json:"eventlog,omitempty"`
+}
+
 // ShirudoStatus represents the JSON output of `shirudo-runtime status --json`.
 type ShirudoStatus struct {
-	Status         string   `json:"status"`
-	UpatchesLoaded []string `json:"upatches_loaded"`
-	TPM            any      `json:"tpm,omitempty"`
-	Kernel         string   `json:"kernel,omitempty"`
-	Arch           string   `json:"arch,omitempty"`
-	Hostname       string   `json:"hostname,omitempty"`
+	Status         string         `json:"status"`
+	UpatchesLoaded []string       `json:"upatches_loaded"`
+	TPM            any            `json:"tpm,omitempty"`
+	Assets         *ShirudoAssets `json:"assets,omitempty"`
+	Kernel         string         `json:"kernel,omitempty"`
+	Arch           string         `json:"arch,omitempty"`
+	Hostname       string         `json:"hostname,omitempty"`
 }
 
 func (s *ShirudoStatus) UnmarshalJSON(data []byte) error {
@@ -87,6 +94,7 @@ func (s *ShirudoStatus) UnmarshalJSON(data []byte) error {
 		Status         string          `json:"status"`
 		UpatchesLoaded json.RawMessage `json:"upatches_loaded"`
 		TPM            any             `json:"tpm,omitempty"`
+		Assets         *ShirudoAssets  `json:"assets,omitempty"`
 		Kernel         string          `json:"kernel,omitempty"`
 		Arch           string          `json:"arch,omitempty"`
 		Hostname       string          `json:"hostname,omitempty"`
@@ -97,6 +105,7 @@ func (s *ShirudoStatus) UnmarshalJSON(data []byte) error {
 	}
 	s.Status = raw.Status
 	s.TPM = raw.TPM
+	s.Assets = raw.Assets
 	s.Kernel = raw.Kernel
 	s.Arch = raw.Arch
 	s.Hostname = raw.Hostname
@@ -199,6 +208,14 @@ func WithHTTPClient(client *http.Client) ShirudoOption {
 	}
 }
 
+// WithEventlogPath overrides the path to the Shirudo TPM eventlog file used to
+// detect the NV writer key size (RSA-3072 vs RSA-2048 fallback).
+func WithEventlogPath(path string) ShirudoOption {
+	return func(s *ShirudoRuntime) {
+		s.eventlogPath = strings.TrimSpace(path)
+	}
+}
+
 // ShirudoRuntime implements Runtime by shelling out to the shirudo-runtime CLI.
 //
 // Revert / unload convention: the operator builds a signed UNLOAD directive
@@ -216,6 +233,7 @@ type ShirudoRuntime struct {
 	hostname       string
 	upatchDir      string
 	stateDir       string
+	eventlogPath   string
 	rollout        string
 	connectorURL   string
 	localToken     string
@@ -227,7 +245,8 @@ type ShirudoRuntime struct {
 
 // NewShirudo constructs a ShirudoRuntime configured from environment variables
 // (SHIRUDO_RUNTIME_BIN, NODE_NAME/HOSTNAME, SHIRUDO_UPATCH_DIR, SHIRUDO_STATE_DIR,
-// TREEWARD_ROLLOUT, TREEWARD_CONNECTOR_URL, TREEWARD_LOCAL_TOKEN) and optional overrides.
+// SHIRUDO_EVENTLOG_PATH, TREEWARD_ROLLOUT, TREEWARD_CONNECTOR_URL, TREEWARD_LOCAL_TOKEN)
+// and optional overrides.
 func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 	host, _ := os.Hostname()
 	hostname := env("NODE_NAME", env("HOSTNAME", host))
@@ -241,6 +260,7 @@ func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 		hostname:       hostname,
 		upatchDir:      env("SHIRUDO_UPATCH_DIR", ""),
 		stateDir:       env("SHIRUDO_STATE_DIR", DefaultShirudoStateDir),
+		eventlogPath:   strings.TrimSpace(os.Getenv("SHIRUDO_EVENTLOG_PATH")),
 		rollout:        strings.TrimSpace(os.Getenv("TREEWARD_ROLLOUT")),
 		connectorURL:   strings.TrimRight(strings.TrimSpace(os.Getenv("TREEWARD_CONNECTOR_URL")), "/"),
 		localToken:     os.Getenv("TREEWARD_LOCAL_TOKEN"),
@@ -408,6 +428,9 @@ func (s *ShirudoRuntime) Inventory() ([]types.Node, error) {
 	}
 	if s.rollout != "" {
 		labels[types.LabelRollout] = s.rollout
+	}
+	if nvWriter := s.detectTPMNvWriter(st); nvWriter != "" {
+		labels[types.LabelTPMNvWriter] = nvWriter
 	}
 
 	loaded := make([]string, len(st.UpatchesLoaded))
@@ -778,4 +801,143 @@ func readKernelRelease() string {
 		return s
 	}
 	return "unknown"
+}
+
+func readBootID() string {
+	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// classifyNVWriterPublicHex classifies a hex-encoded RSA NV writer public modulus.
+// 256 bytes (512 hex chars) -> rsa2048-fallback; 384 bytes (768 hex chars) -> rsa3072.
+func classifyNVWriterPublicHex(hexStr string) string {
+	s := strings.TrimSpace(hexStr)
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	if s == "" {
+		return ""
+	}
+	raw, err := hex.DecodeString(s)
+	if err != nil {
+		return ""
+	}
+	return classifyNVWriterKeyLen(len(raw))
+}
+
+func classifyNVWriterKeyLen(n int) string {
+	switch n {
+	case 256:
+		return types.TPMNvWriterRSA2048Fallback
+	case 384:
+		return types.TPMNvWriterRSA3072
+	default:
+		return ""
+	}
+}
+
+func detectTPMNvWriterFromStatus(st ShirudoStatus) string {
+	tpmMap, ok := st.TPM.(map[string]any)
+	if !ok || tpmMap == nil {
+		return ""
+	}
+	if pub, ok := tpmMap["nv_writer_public"].(string); ok && pub != "" {
+		if v := classifyNVWriterPublicHex(pub); v != "" {
+			return v
+		}
+	}
+	if l, ok := tpmMap["nv_writer_public_len"].(float64); ok {
+		if v := classifyNVWriterKeyLen(int(l)); v != "" {
+			return v
+		}
+	}
+	if bits, ok := tpmMap["nv_writer_bits"].(float64); ok {
+		switch int(bits) {
+		case 2048:
+			return types.TPMNvWriterRSA2048Fallback
+		case 3072:
+			return types.TPMNvWriterRSA3072
+		}
+	}
+	for _, key := range []string{"nv_writer_alg", "nv_writer"} {
+		if raw, ok := tpmMap[key].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(raw)) {
+			case "rsa2048-fallback", "rsa2048", "rsa-2048":
+				return types.TPMNvWriterRSA2048Fallback
+			case "rsa3072", "rsa-3072":
+				return types.TPMNvWriterRSA3072
+			}
+		}
+	}
+	return ""
+}
+
+type shirudoEventlogEntry struct {
+	Type           string `json:"type"`
+	BootID         string `json:"boot_id"`
+	NVName         string `json:"nv_name"`
+	NVWriterPublic string `json:"nv_writer_public"`
+}
+
+func detectTPMNvWriterFromEventlog(path, wantNVName, wantBootID string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var exactMatch string
+	var lastInit string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry shirudoEventlogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry.Type != "" && entry.Type != "init" {
+			continue
+		}
+		if entry.NVWriterPublic == "" {
+			continue
+		}
+		lastInit = entry.NVWriterPublic
+		if (wantNVName != "" && entry.NVName == wantNVName) ||
+			(wantBootID != "" && entry.BootID == wantBootID) {
+			exactMatch = entry.NVWriterPublic
+		}
+	}
+	if exactMatch != "" {
+		return classifyNVWriterPublicHex(exactMatch)
+	}
+	if lastInit != "" {
+		return classifyNVWriterPublicHex(lastInit)
+	}
+	return ""
+}
+
+func (s *ShirudoRuntime) detectTPMNvWriter(st ShirudoStatus) string {
+	if v := detectTPMNvWriterFromStatus(st); v != "" {
+		return v
+	}
+	eventlogPath := s.eventlogPath
+	if eventlogPath == "" {
+		if st.Assets != nil && st.Assets.Root != "" {
+			eventlogPath = filepath.Join(st.Assets.Root, "eventlog")
+		} else {
+			eventlogPath = "/var/lib/shirudo/eventlog"
+		}
+	}
+	var wantNVName string
+	if tpmMap, ok := st.TPM.(map[string]any); ok && tpmMap != nil {
+		if nvName, ok := tpmMap["nv_name"].(string); ok {
+			wantNVName = strings.TrimSpace(nvName)
+		}
+	}
+	return detectTPMNvWriterFromEventlog(eventlogPath, wantNVName, readBootID())
 }
