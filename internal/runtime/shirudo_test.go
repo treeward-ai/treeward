@@ -1002,3 +1002,92 @@ exit 1
 		t.Fatalf("calls = %v, want [status --json]", calls)
 	}
 }
+
+func TestShirudoInventoryTPMNvWriterFromEventlog(t *testing.T) {
+	rsa2048Hex := strings.Repeat("ab", 256) // 256 bytes = 512 hex chars
+	rsa3072Hex := strings.Repeat("cd", 384) // 384 bytes = 768 hex chars
+
+	cases := []struct {
+		name       string
+		statusJSON string
+		eventlog   string
+		wantLabel  string
+	}{
+		{
+			name:       "rsa2048-fallback from eventlog via assets.root",
+			statusJSON: `{"status":"ok","upatches_loaded":[],"tpm":{"reachable":true,"nv_name":"000bnew"},"assets":{"root":"__ROOT__","eventlog":true}}`,
+			eventlog:   `{"type":"init","boot_id":"boot-1","nv_name":"000bnew","nv_writer_public":"` + rsa2048Hex + `"}` + "\n",
+			wantLabel:  types.TPMNvWriterRSA2048Fallback,
+		},
+		{
+			name:       "rsa3072 from eventlog via assets.root",
+			statusJSON: `{"status":"ok","upatches_loaded":[],"tpm":{"reachable":true,"nv_name":"000b3072"},"assets":{"root":"__ROOT__","eventlog":true}}`,
+			eventlog:   `{"type":"init","boot_id":"boot-2","nv_name":"000b3072","nv_writer_public":"` + rsa3072Hex + `"}` + "\n",
+			wantLabel:  types.TPMNvWriterRSA3072,
+		},
+		{
+			name:       "multi-boot eventlog matches current tpm.nv_name",
+			statusJSON: `{"status":"ok","upatches_loaded":[],"tpm":{"reachable":true,"nv_name":"000bcurr"},"assets":{"root":"__ROOT__","eventlog":true}}`,
+			eventlog: strings.Join([]string{
+				`{"type":"init","boot_id":"boot-old","nv_name":"000bold","nv_writer_public":"` + rsa3072Hex + `"}`,
+				`{"type":"init","boot_id":"boot-curr","nv_name":"000bcurr","nv_writer_public":"` + rsa2048Hex + `"}`,
+				`{"type":"extend","boot_id":"boot-curr","nv_name":"000bcurr"}`,
+			}, "\n") + "\n",
+			wantLabel: types.TPMNvWriterRSA2048Fallback,
+		},
+		{
+			name:       "direct tpm.nv_writer_public in status json",
+			statusJSON: `{"status":"ok","upatches_loaded":[],"tpm":{"reachable":true,"nv_writer_public":"` + rsa2048Hex + `"}}`,
+			eventlog:   "",
+			wantLabel:  types.TPMNvWriterRSA2048Fallback,
+		},
+		{
+			name:       "direct tpm.nv_writer_public_len 384 in status json",
+			statusJSON: `{"status":"ok","upatches_loaded":[],"tpm":{"reachable":true,"nv_writer_public_len":384}}`,
+			eventlog:   "",
+			wantLabel:  types.TPMNvWriterRSA3072,
+		},
+		{
+			name:       "unknown key length omits label",
+			statusJSON: `{"status":"ok","upatches_loaded":[],"tpm":{"reachable":true,"nv_name":"000bweird"},"assets":{"root":"__ROOT__","eventlog":true}}`,
+			eventlog:   `{"type":"init","boot_id":"boot-3","nv_name":"000bweird","nv_writer_public":"` + strings.Repeat("ef", 128) + `"}` + "\n",
+			wantLabel:  "",
+		},
+		{
+			name:       "missing eventlog omits label",
+			statusJSON: `{"status":"ok","upatches_loaded":[],"assets":{"root":"__ROOT__","eventlog":false}}`,
+			eventlog:   "",
+			wantLabel:  "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			if tc.eventlog != "" {
+				if err := os.WriteFile(filepath.Join(rootDir, "eventlog"), []byte(tc.eventlog), 0o600); err != nil {
+					t.Fatalf("write eventlog: %v", err)
+				}
+			}
+			statusBody := strings.ReplaceAll(tc.statusJSON, "__ROOT__", rootDir)
+			bin, _ := writeFakeShirudo(t, "cat <<'JSON'\n"+statusBody+"\nJSON\n")
+
+			rt := NewShirudo(WithShirudoBin(bin), WithNodeID("node-tpm"))
+			nodes, err := rt.Inventory()
+			if err != nil {
+				t.Fatalf("Inventory() error: %v", err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("len(nodes) = %d, want 1", len(nodes))
+			}
+			got, exists := nodes[0].Labels[types.LabelTPMNvWriter]
+			if tc.wantLabel == "" {
+				if exists {
+					t.Fatalf("label %s = %q, want omitted", types.LabelTPMNvWriter, got)
+				}
+			} else if got != tc.wantLabel {
+				t.Fatalf("label %s = %q, want %q", types.LabelTPMNvWriter, got, tc.wantLabel)
+			}
+		})
+	}
+}
