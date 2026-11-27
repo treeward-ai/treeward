@@ -1,12 +1,16 @@
 package signer
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -156,6 +160,45 @@ func TreeOpHash(op types.TreeOp) (string, error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// Verifier verifies TreeOp signatures for a parsed public key.
+type Verifier interface {
+	Verify(payload, sig []byte) error
+	Algorithm() string
+}
+
+type ed25519Verifier struct {
+	pub ed25519.PublicKey
+}
+
+func (v ed25519Verifier) Algorithm() string { return "ED25519" }
+
+func (v ed25519Verifier) Verify(payload, sig []byte) error {
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("invalid ed25519 signature length %d", len(sig))
+	}
+	if !ed25519.Verify(v.pub, payload, sig) {
+		return fmt.Errorf("invalid ed25519 signature")
+	}
+	return nil
+}
+
+type ecdsaP256Verifier struct {
+	pub *ecdsa.PublicKey
+}
+
+func (v ecdsaP256Verifier) Algorithm() string { return "EC_SIGN_P256_SHA256" }
+
+func (v ecdsaP256Verifier) Verify(payload, sig []byte) error {
+	if len(sig) == 0 {
+		return fmt.Errorf("empty ecdsa signature")
+	}
+	digest := sha256.Sum256(payload)
+	if !ecdsa.VerifyASN1(v.pub, digest[:], sig) {
+		return fmt.Errorf("invalid ecdsa p256 signature")
+	}
+	return nil
+}
+
 // ParsePublicKeyHex decodes and validates a hex-encoded Ed25519 public key.
 func ParsePublicKeyHex(pubKeyHex string) (ed25519.PublicKey, error) {
 	pubKeyHex = strings.TrimSpace(pubKeyHex)
@@ -172,16 +215,58 @@ func ParsePublicKeyHex(pubKeyHex string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(raw), nil
 }
 
-// VerifyTreeOp verifies the Ed25519 signature over a single TreeOp's canonical payload.
-func VerifyTreeOp(pubKeyHex string, op types.TreeOp) error {
-	pub, err := ParsePublicKeyHex(pubKeyHex)
+// ParsePublicKey parses either a PKIX PEM public key (ECDSA P-256, matching
+// Cloud KMS EC_SIGN_P256_SHA256, or Ed25519) or a hex-encoded Ed25519 key.
+func ParsePublicKey(pubKey string) (Verifier, error) {
+	pubKey = strings.TrimSpace(pubKey)
+	if pubKey == "" {
+		return nil, fmt.Errorf("empty public key")
+	}
+	if strings.Contains(pubKey, "-----BEGIN ") {
+		if !strings.Contains(pubKey, "\n") && strings.Contains(pubKey, `\n`) {
+			pubKey = strings.ReplaceAll(pubKey, `\n`, "\n")
+		}
+		block, _ := pem.Decode([]byte(pubKey))
+		if block == nil {
+			return nil, fmt.Errorf("decode public key pem: invalid pem block")
+		}
+		parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse pkix public key: %w", err)
+		}
+		switch k := parsed.(type) {
+		case *ecdsa.PublicKey:
+			if k.Curve != elliptic.P256() {
+				return nil, fmt.Errorf("unsupported ecdsa curve %q (want P-256)", k.Curve.Params().Name)
+			}
+			return ecdsaP256Verifier{pub: k}, nil
+		case ed25519.PublicKey:
+			if len(k) != ed25519.PublicKeySize {
+				return nil, fmt.Errorf("invalid ed25519 public key length: got %d, want %d", len(k), ed25519.PublicKeySize)
+			}
+			return ed25519Verifier{pub: k}, nil
+		default:
+			return nil, fmt.Errorf("unsupported pkix public key type %T", parsed)
+		}
+	}
+	pub, err := ParsePublicKeyHex(pubKey)
+	if err != nil {
+		return nil, err
+	}
+	return ed25519Verifier{pub: pub}, nil
+}
+
+// VerifyTreeOp verifies the signature over a single TreeOp's canonical payload
+// using either a hex-encoded Ed25519 key or a PKIX PEM ECDSA P-256 key.
+func VerifyTreeOp(pubKey string, op types.TreeOp) error {
+	v, err := ParsePublicKey(pubKey)
 	if err != nil {
 		return err
 	}
-	return verifyTreeOpWithKey(pub, op)
+	return verifyTreeOpWithVerifier(v, op)
 }
 
-func verifyTreeOpWithKey(pub ed25519.PublicKey, op types.TreeOp) error {
+func verifyTreeOpWithVerifier(v Verifier, op types.TreeOp) error {
 	if op.Signature == "" {
 		return fmt.Errorf("tree op seq=%d: missing signature", op.Seq)
 	}
@@ -189,30 +274,27 @@ func verifyTreeOpWithKey(pub ed25519.PublicKey, op types.TreeOp) error {
 	if err != nil {
 		return fmt.Errorf("tree op seq=%d: decode signature: %w", op.Seq, err)
 	}
-	if len(sig) != ed25519.SignatureSize {
-		return fmt.Errorf("tree op seq=%d: invalid signature length %d", op.Seq, len(sig))
-	}
 	payload, err := CanonicalTreePayload(op)
 	if err != nil {
 		return fmt.Errorf("tree op seq=%d: %w", op.Seq, err)
 	}
-	if !ed25519.Verify(pub, payload, sig) {
-		return fmt.Errorf("tree op seq=%d: invalid ed25519 signature", op.Seq)
+	if err := v.Verify(payload, sig); err != nil {
+		return fmt.Errorf("tree op seq=%d: %w", op.Seq, err)
 	}
 	return nil
 }
 
 // VerifyTreeChain verifies that ops form a valid, strictly sequential,
-// hash-chained, Ed25519-signed tree log starting at seq 1 (or an empty tree).
-func VerifyTreeChain(pubKeyHex string, ops []types.TreeOp) error {
-	return VerifyTreeChainFrom(pubKeyHex, ops, 0)
+// hash-chained, signed tree log starting at seq 1 (or an empty tree).
+func VerifyTreeChain(pubKey string, ops []types.TreeOp) error {
+	return VerifyTreeChainFrom(pubKey, ops, 0)
 }
 
 // VerifyTreeChainFrom verifies the full tree chain and rejects rollback if the
 // verified chain length is smaller than lastVerifiedSeq. An empty tree (seq=0)
 // is accepted only when lastVerifiedSeq == 0.
-func VerifyTreeChainFrom(pubKeyHex string, ops []types.TreeOp, lastVerifiedSeq int64) error {
-	pub, err := ParsePublicKeyHex(pubKeyHex)
+func VerifyTreeChainFrom(pubKey string, ops []types.TreeOp, lastVerifiedSeq int64) error {
+	v, err := ParsePublicKey(pubKey)
 	if err != nil {
 		return err
 	}
@@ -238,7 +320,7 @@ func VerifyTreeChainFrom(pubKeyHex string, ops []types.TreeOp, lastVerifiedSeq i
 		} else if op.PrevHash != prevHash {
 			return fmt.Errorf("tree op seq=%d: prevHash mismatch: got %q, want %q", op.Seq, op.PrevHash, prevHash)
 		}
-		if err := verifyTreeOpWithKey(pub, op); err != nil {
+		if err := verifyTreeOpWithVerifier(v, op); err != nil {
 			return err
 		}
 		prevHash, err = TreeOpHash(op)

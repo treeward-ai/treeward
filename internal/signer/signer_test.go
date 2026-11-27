@@ -2,8 +2,14 @@ package signer
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"reflect"
 	"strings"
 	"testing"
@@ -447,5 +453,86 @@ func TestVerifyTreeChainTamperingRejected(t *testing.T) {
 				t.Fatalf("expected VerifyTreeChainFrom to reject %q, got nil", tc.name)
 			}
 		})
+	}
+}
+
+type p256TestSigner struct {
+	priv   *ecdsa.PrivateKey
+	pubPEM string
+}
+
+func newP256TestSigner(t *testing.T, curve elliptic.Curve) *p256TestSigner {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("MarshalPKIXPublicKey: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+	return &p256TestSigner{priv: priv, pubPEM: string(pemBytes)}
+}
+
+func (s *p256TestSigner) Sign(payload []byte) (string, error) {
+	digest := sha256.Sum256(payload)
+	sig, err := ecdsa.SignASN1(rand.Reader, s.priv, digest[:])
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(sig), nil
+}
+
+func (s *p256TestSigner) PublicKeyHex() string { return s.pubPEM }
+
+func TestVerifyTreeChainECDSAP256(t *testing.T) {
+	s := newP256TestSigner(t, elliptic.P256())
+	other := newP256TestSigner(t, elliptic.P256())
+	p384 := newP256TestSigner(t, elliptic.P384())
+
+	v, err := ParsePublicKey(s.pubPEM)
+	if err != nil {
+		t.Fatalf("ParsePublicKey(P-256 PEM): %v", err)
+	}
+	if v.Algorithm() != "EC_SIGN_P256_SHA256" {
+		t.Fatalf("Algorithm = %q, want EC_SIGN_P256_SHA256", v.Algorithm())
+	}
+
+	if _, err := ParsePublicKey(p384.pubPEM); err == nil {
+		t.Fatal("expected ParsePublicKey to reject P-384 key")
+	}
+	if _, err := ParsePublicKey("-----BEGIN PUBLIC KEY-----\nnot-valid\n-----END PUBLIC KEY-----"); err == nil {
+		t.Fatal("expected ParsePublicKey to reject malformed PEM")
+	}
+
+	ops := buildValidChain(t, s)
+	if err := VerifyTreeOp(s.pubPEM, ops[0]); err != nil {
+		t.Fatalf("VerifyTreeOp(P-256): %v", err)
+	}
+	if err := VerifyTreeChain(s.pubPEM, ops); err != nil {
+		t.Fatalf("VerifyTreeChain(P-256): %v", err)
+	}
+	if err := VerifyTreeChainFrom(s.pubPEM, ops, int64(len(ops))); err != nil {
+		t.Fatalf("VerifyTreeChainFrom(P-256): %v", err)
+	}
+
+	// Wrong P-256 public key must fail.
+	if err := VerifyTreeChain(other.pubPEM, ops); err == nil {
+		t.Fatal("expected VerifyTreeChain to reject wrong P-256 public key")
+	}
+
+	// Tampered payload must fail.
+	tampered := append([]types.TreeOp(nil), ops...)
+	tampered[1].Digest = "sha256:tampered"
+	if err := VerifyTreeChain(s.pubPEM, tampered); err == nil {
+		t.Fatal("expected VerifyTreeChain to reject tampered op with P-256")
+	}
+
+	// Corrupted DER signature must fail.
+	badSig := append([]types.TreeOp(nil), ops...)
+	badSig[0].Signature = base64.StdEncoding.EncodeToString([]byte("not-asn1-der"))
+	if err := VerifyTreeOp(s.pubPEM, badSig[0]); err == nil {
+		t.Fatal("expected VerifyTreeOp to reject malformed DER signature")
 	}
 }

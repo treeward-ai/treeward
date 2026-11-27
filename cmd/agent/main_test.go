@@ -1,7 +1,14 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -481,4 +488,64 @@ func roundTripDesired(t *testing.T, d types.DesiredState) types.DesiredState {
 		t.Fatalf("unmarshal desired: %v", err)
 	}
 	return out
+}
+
+func TestResolveTreeVerifyConfigAndApplyECDSAP256(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPEM := strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})))
+
+	gotPub, warn, err := resolveTreeVerifyConfig("shirudo", "", pubPEM)
+	if err != nil {
+		t.Fatalf("resolveTreeVerifyConfig(P-256 PEM): %v", err)
+	}
+	if warn != "" || gotPub != pubPEM {
+		t.Fatalf("unexpected result: warn=%q match=%v", warn, gotPub == pubPEM)
+	}
+
+	op := types.TreeOp{
+		Seq:       1,
+		Op:        "add",
+		Digest:    "sha256:p256patch",
+		Selector:  map[string]string{"tier": "web"},
+		BindingID: "bind-p256",
+		At:        time.Date(2026, 11, 27, 12, 0, 0, 120000000, time.UTC),
+	}
+	payload, err := signer.CanonicalTreePayload(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(payload)
+	sig, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	op.Signature = base64.StdEncoding.EncodeToString(sig)
+
+	nodes := []types.Node{{ID: "node-1", Labels: map[string]string{"tier": "web"}}}
+	desired := roundTripDesired(t, types.DesiredState{
+		TreeSeq:    1,
+		TreePubKey: pubPEM,
+		TreeKeyAlg: "EC_SIGN_P256_SHA256",
+		Ops:        []types.TreeOp{op},
+		Nodes:      map[string][]string{"node-1": {"sha256:evil-ignored"}},
+	})
+
+	rt := &spyRuntime{nodes: nodes}
+	loaded, _, seq, err := applyDesiredState(rt, gotPub, 0, desired, nodes)
+	if err != nil {
+		t.Fatalf("applyDesiredState(P-256): %v", err)
+	}
+	if seq != 1 || rt.applyCalls != 1 {
+		t.Fatalf("seq=%d applyCalls=%d, want 1, 1", seq, rt.applyCalls)
+	}
+	if !reflect.DeepEqual(loaded["node-1"], []string{"sha256:p256patch"}) {
+		t.Fatalf("loaded[node-1] = %v, want [sha256:p256patch]", loaded["node-1"])
+	}
 }

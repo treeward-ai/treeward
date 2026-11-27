@@ -93,6 +93,7 @@ type TreeOp struct {
 type DesiredState struct {
 	TreeSeq    int64               `json:"treeSeq"`
 	TreePubKey string              `json:"treePubKey,omitempty"`
+	TreeKeyAlg string              `json:"treeKeyAlg,omitempty"`
 	Ops        []TreeOp            `json:"ops"`
 	Nodes      map[string][]string `json:"nodes"` // nodeID -> digests that should be loaded
 }

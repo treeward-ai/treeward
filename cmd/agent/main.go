@@ -233,7 +233,7 @@ func resolveTreeVerifyConfig(runtimeKind, verifyEnv, pubKeyHex string) (string, 
 		return "", "", fmt.Errorf("tree verification is enabled for runtime=%s but TREEWARD_TREE_PUBKEY is empty (obtain treePubKey from GET /v1/desired and pin it out-of-band, or set TREEWARD_VERIFY_TREE=0 to disable)", runtimeKind)
 	}
 	if pubKeyHex != "" {
-		if _, err := signer.ParsePublicKeyHex(pubKeyHex); err != nil {
+		if _, err := signer.ParsePublicKey(pubKeyHex); err != nil {
 			return "", "", fmt.Errorf("invalid TREEWARD_TREE_PUBKEY: %w", err)
 		}
 	}

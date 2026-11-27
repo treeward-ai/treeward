@@ -20,7 +20,28 @@ import (
 
 const maxLocalBodyBytes = 4 << 20 // 4 MiB
 
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+const connectorUserAgent = "treeward-connector/0.1"
+
+type userAgentTransport struct {
+	base http.RoundTripper
+}
+
+func (t userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	if r.Header.Get("User-Agent") == "" {
+		r.Header.Set("User-Agent", connectorUserAgent)
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(r)
+}
+
+var httpClient = &http.Client{
+	Timeout:   15 * time.Second,
+	Transport: userAgentTransport{},
+}
 
 // Connector sits between node agents and the Treeward API.
 // Agents POST inventory/status here; connector enrolls and phones home.
