@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 )
 
 // maxUpatchBytes caps proxied upatch payloads. Matches the agent-side limit.
@@ -29,6 +30,7 @@ func proxyUpatch(w http.ResponseWriter, apiURL string, creds *credManager, sha, 
 		http.Error(w, "invalid_sha256", http.StatusBadRequest)
 		return
 	}
+	sha = strings.ToLower(sha)
 	tok, _ := creds.snapshot()
 	status, hdr, body, err := fetchUpatchBytes(apiURL+"/v1/upatches/"+sha+suffix, tok)
 	if err != nil {

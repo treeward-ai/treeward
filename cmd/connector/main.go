@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -18,7 +20,14 @@ import (
 	"github.com/treeward-ai/treeward/internal/types"
 )
 
-const maxLocalBodyBytes = 4 << 20 // 4 MiB
+const (
+	maxLocalBodyBytes    = 4 << 20 // 4 MiB
+	maxResponseBodyBytes = 4 << 20 // 4 MiB
+	agentStaleTTL        = 5 * time.Minute
+	maxTrackedAgents     = 4096
+	maxSubmittedIDs      = 256
+	submittedIDTTL       = 24 * time.Hour
+)
 
 const connectorUserAgent = "treeward-connector/0.1"
 
@@ -38,22 +47,203 @@ func (t userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	return base.RoundTrip(r)
 }
 
+func noRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 var httpClient = &http.Client{
-	Timeout:   15 * time.Second,
-	Transport: userAgentTransport{},
+	Timeout:       15 * time.Second,
+	Transport:     userAgentTransport{},
+	CheckRedirect: noRedirect,
 }
 
 // Connector sits between node agents and the Treeward API.
 // Agents POST inventory/status here; connector enrolls and phones home.
 
 type agentState struct {
-	Node   types.Node
-	Loaded []string
-	Errors []string
+	Node     types.Node
+	Loaded   []string
+	Errors   []string
+	LastSeen time.Time
+}
+
+type connectorState struct {
+	mu           sync.Mutex
+	agents       map[string]*agentState
+	pending      *types.PendingAttest
+	quotes       map[string]types.AttestResult // nodeID -> quote for current campaign
+	submitted    map[string]time.Time          // campaignID -> submittedAt
+	inFlight     map[string]bool               // campaignID currently being submitted
+	nowFn        func() time.Time
+	staleTTL     time.Duration
+	maxAgents    int
+	maxSubmitted int
+	submittedTTL time.Duration
+}
+
+func newConnectorState() *connectorState {
+	return &connectorState{
+		agents:       map[string]*agentState{},
+		quotes:       map[string]types.AttestResult{},
+		submitted:    map[string]time.Time{},
+		inFlight:     map[string]bool{},
+		nowFn:        time.Now,
+		staleTTL:     agentStaleTTL,
+		maxAgents:    maxTrackedAgents,
+		maxSubmitted: maxSubmittedIDs,
+		submittedTTL: submittedIDTTL,
+	}
+}
+
+func (s *connectorState) evictStaleAgentsLocked(now time.Time) {
+	if s.staleTTL <= 0 {
+		return
+	}
+	for id, a := range s.agents {
+		if now.Sub(a.LastSeen) > s.staleTTL {
+			delete(s.agents, id)
+		}
+	}
+}
+
+func (s *connectorState) pruneSubmittedLocked(now time.Time) {
+	if s.submittedTTL > 0 {
+		for id, ts := range s.submitted {
+			if now.Sub(ts) > s.submittedTTL {
+				delete(s.submitted, id)
+			}
+		}
+	}
+	for s.maxSubmitted > 0 && len(s.submitted) > s.maxSubmitted {
+		var oldestID string
+		var oldestTS time.Time
+		first := true
+		for id, ts := range s.submitted {
+			if first || ts.Before(oldestTS) {
+				oldestID = id
+				oldestTS = ts
+				first = false
+			}
+		}
+		delete(s.submitted, oldestID)
+	}
+}
+
+func (s *connectorState) recordReports(cid string, reports []types.AgentReport) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowFn()
+	s.evictStaleAgentsLocked(now)
+	for _, rep := range reports {
+		if _, exists := s.agents[rep.Node.ID]; !exists && s.maxAgents > 0 && len(s.agents) >= s.maxAgents {
+			log.Printf("connector: tracked agents limit (%d) reached; ignoring report for node=%s", s.maxAgents, rep.Node.ID)
+			continue
+		}
+		rep.Node.ClusterID = cid
+		s.agents[rep.Node.ID] = &agentState{
+			Node:     rep.Node,
+			Loaded:   rep.Loaded,
+			Errors:   append([]string{}, rep.Errors...),
+			LastSeen: now,
+		}
+	}
+}
+
+func (s *connectorState) snapshotForSync(cid string) ([]types.Node, []types.AgentReport) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.nowFn()
+	s.evictStaleAgentsLocked(now)
+	s.pruneSubmittedLocked(now)
+	nodes := make([]types.Node, 0, len(s.agents))
+	reports := make([]types.AgentReport, 0, len(s.agents))
+	for _, a := range s.agents {
+		n := a.Node
+		n.Loaded = a.Loaded
+		n.ClusterID = cid
+		nodes = append(nodes, n)
+		reports = append(reports, types.AgentReport{
+			Node:   n,
+			Loaded: a.Loaded,
+			Errors: append([]string{}, a.Errors...),
+		})
+	}
+	return nodes, reports
+}
+
+func (s *connectorState) getPending() *types.PendingAttest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending
+}
+
+func (s *connectorState) setPending(p *types.PendingAttest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p == nil {
+		s.pending = nil
+		return
+	}
+	if _, already := s.submitted[p.ID]; already {
+		s.pending = nil
+		return
+	}
+	if s.pending == nil || s.pending.ID != p.ID {
+		s.pending = p
+		s.quotes = map[string]types.AttestResult{}
+		log.Printf("attest campaign pending id=%s", p.ID)
+	}
+}
+
+func (s *connectorState) recordAttestResults(results []types.AttestResult) (campID string, batch []types.AttestResult, shouldSubmit bool, hasPending bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil {
+		return "", nil, false, false
+	}
+	now := s.nowFn()
+	s.evictStaleAgentsLocked(now)
+	campID = s.pending.ID
+	for _, res := range results {
+		res.Nonce = s.pending.Nonce
+		s.quotes[res.NodeID] = res
+	}
+	ready := len(s.agents) > 0
+	for id := range s.agents {
+		if _, ok := s.quotes[id]; !ok {
+			ready = false
+			break
+		}
+	}
+	_, already := s.submitted[campID]
+	if ready && !already && !s.inFlight[campID] {
+		s.inFlight[campID] = true
+		batch = make([]types.AttestResult, 0, len(s.quotes))
+		for _, q := range s.quotes {
+			batch = append(batch, q)
+		}
+		return campID, batch, true, true
+	}
+	return campID, nil, false, true
+}
+
+func (s *connectorState) finishAttestSubmit(campID string, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inFlight, campID)
+	if ok {
+		now := s.nowFn()
+		s.submitted[campID] = now
+		s.pruneSubmittedLocked(now)
+		if s.pending != nil && s.pending.ID == campID {
+			s.pending = nil
+			s.quotes = map[string]types.AttestResult{}
+		}
+	}
 }
 
 func main() {
-	apiURL := env("TREEWARD_API_URL", "http://treeward-api:8080")
+	apiURL := strings.TrimRight(env("TREEWARD_API_URL", "http://treeward-api:8080"), "/")
 	enrollToken := os.Getenv("TREEWARD_ENROLL_TOKEN")
 	if enrollToken == "" {
 		log.Fatal("TREEWARD_ENROLL_TOKEN is required")
@@ -66,6 +256,9 @@ func main() {
 		if !localAuthDisabled {
 			log.Fatal("TREEWARD_LOCAL_TOKEN is required (set TREEWARD_LOCAL_AUTH=off for local dev only)")
 		}
+		if !isLoopbackListenAddr(listen) {
+			log.Fatalf("refusing to start with TREEWARD_LOCAL_AUTH=off on non-loopback address %q (bind to 127.0.0.1, ::1, or localhost, or set TREEWARD_LOCAL_TOKEN)", listen)
+		}
 		log.Printf("WARNING: TREEWARD_LOCAL_AUTH=off and TREEWARD_LOCAL_TOKEN is empty; local connector endpoints are unauthenticated (local dev only)")
 	}
 	interval := 5 * time.Second
@@ -77,11 +270,7 @@ func main() {
 	_, clusterID := creds.snapshot()
 	log.Printf("enrolled connector cluster=%s", clusterID)
 
-	var mu sync.Mutex
-	agents := map[string]*agentState{}
-	var pending *types.PendingAttest
-	quotes := map[string]types.AttestResult{} // nodeID -> quote for current campaign
-	submitted := map[string]bool{}            // campaignID already pushed upstream
+	state := newConnectorState()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -95,12 +284,7 @@ func main() {
 			return
 		}
 		_, cid := creds.snapshot()
-		mu.Lock()
-		for _, rep := range reports {
-			rep.Node.ClusterID = cid
-			agents[rep.Node.ID] = &agentState{Node: rep.Node, Loaded: rep.Loaded, Errors: append([]string{}, rep.Errors...)}
-		}
-		mu.Unlock()
+		state.recordReports(cid, reports)
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -125,9 +309,7 @@ func main() {
 	}))
 
 	mux.HandleFunc("GET /v1/local/attest", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		p := pending
-		mu.Unlock()
+		p := state.getPending()
 		if p == nil {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -142,55 +324,32 @@ func main() {
 		if !decodeLocalJSON(w, r, &results) {
 			return
 		}
-		mu.Lock()
-		if pending == nil {
-			mu.Unlock()
+		campID, batch, shouldSubmit, hasPending := state.recordAttestResults(results)
+		if !hasPending {
 			http.Error(w, "no active campaign", http.StatusConflict)
 			return
 		}
-		campID := pending.ID
-		for _, res := range results {
-			res.Nonce = pending.Nonce
-			quotes[res.NodeID] = res
-		}
-		ready := len(agents) > 0
-		for id := range agents {
-			if _, ok := quotes[id]; !ok {
-				ready = false
-				break
-			}
-		}
-		batch := make([]types.AttestResult, 0, len(quotes))
-		if ready {
-			for _, q := range quotes {
-				batch = append(batch, q)
-			}
-		}
-		already := submitted[campID]
-		mu.Unlock()
 
-		if ready && !already {
+		if shouldSubmit {
+			resultsURL := fmt.Sprintf("%s/v1/attest/campaigns/%s/results", apiURL, url.PathEscape(campID))
 			tok, _ := creds.snapshot()
-			if err := postJSON(apiURL+"/v1/attest/campaigns/"+campID+"/results", tok, batch, nil); err != nil {
+			if err := postJSON(resultsURL, tok, batch, nil); err != nil {
 				if isUnauthorized(err) {
 					if rerr := creds.reenroll(tok); rerr != nil {
 						log.Printf("re-enroll: %v", rerr)
 					} else {
 						tok, _ = creds.snapshot()
-						err = postJSON(apiURL+"/v1/attest/campaigns/"+campID+"/results", tok, batch, nil)
+						err = postJSON(resultsURL, tok, batch, nil)
 					}
 				}
 				if err != nil {
+					state.finishAttestSubmit(campID, false)
 					log.Printf("attest submit: %v", err)
 					http.Error(w, err.Error(), http.StatusBadGateway)
 					return
 				}
 			}
-			mu.Lock()
-			submitted[campID] = true
-			pending = nil
-			quotes = map[string]types.AttestResult{}
-			mu.Unlock()
+			state.finishAttestSubmit(campID, true)
 			log.Printf("attest campaign %s submitted (%d quotes)", campID, len(batch))
 		}
 		w.WriteHeader(http.StatusOK)
@@ -201,21 +360,7 @@ func main() {
 		defer t.Stop()
 		for range t.C {
 			tok, cid := creds.snapshot()
-			mu.Lock()
-			nodes := make([]types.Node, 0, len(agents))
-			reports := make([]types.AgentReport, 0, len(agents))
-			for _, a := range agents {
-				n := a.Node
-				n.Loaded = a.Loaded
-				n.ClusterID = cid
-				nodes = append(nodes, n)
-				reports = append(reports, types.AgentReport{
-					Node:   n,
-					Loaded: a.Loaded,
-					Errors: append([]string{}, a.Errors...),
-				})
-			}
-			mu.Unlock()
+			nodes, reports := state.snapshotForSync(cid)
 			if len(nodes) > 0 {
 				if err := upsertInventory(apiURL, tok, cid, nodes); err != nil {
 					if isUnauthorized(err) {
@@ -260,17 +405,7 @@ func main() {
 					continue
 				}
 			}
-			mu.Lock()
-			if p == nil {
-				pending = nil
-			} else if submitted[p.ID] {
-				pending = nil
-			} else if pending == nil || pending.ID != p.ID {
-				pending = p
-				quotes = map[string]types.AttestResult{}
-				log.Printf("attest campaign pending id=%s", p.ID)
-			}
-			mu.Unlock()
+			state.setPending(p)
 		}
 	}()
 
@@ -299,6 +434,11 @@ func main() {
 	log.Fatal(httpSrv.ListenAndServe())
 }
 
+type reenrollFlight struct {
+	done chan struct{}
+	err  error
+}
+
 type credManager struct {
 	mu             sync.Mutex
 	apiURL         string
@@ -306,9 +446,11 @@ type credManager struct {
 	cluster        string
 	token          string
 	clusterID      string
+	tokenGen       uint64
 	lastAttempt    time.Time
 	backoff        time.Duration
 	enrollRejected bool
+	flight         *reenrollFlight
 	enrollFn       func(apiURL, enrollToken, cluster string) (string, string, error)
 	nowFn          func() time.Time
 	sleepFn        func(time.Duration)
@@ -339,6 +481,7 @@ func (c *credManager) enrollWithRetry(maxAttempts int) error {
 			c.mu.Lock()
 			c.token = tok
 			c.clusterID = cid
+			c.tokenGen++
 			c.backoff = 0
 			c.enrollRejected = false
 			c.mu.Unlock()
@@ -364,47 +507,76 @@ func (c *credManager) enrollWithRetry(maxAttempts int) error {
 
 func (c *credManager) reenroll(failedToken string) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
+	// If another caller already rotated the token since our failed request,
+	// skip redundant re-enrollment.
 	if failedToken != "" && c.token != "" && c.token != failedToken {
+		c.mu.Unlock()
 		return nil
 	}
-	// Clear stale token so subsequent calls don't keep reusing it.
-	c.token = ""
+
+	// Coalesce concurrent 401s onto a single in-flight enrollFn call without
+	// holding c.mu across network I/O.
+	if c.flight != nil {
+		flight := c.flight
+		c.mu.Unlock()
+		<-flight.done
+		return flight.err
+	}
 
 	if c.enrollRejected {
+		c.mu.Unlock()
 		return errors.New("re-enroll halted: enroll token rejected")
 	}
 
 	now := c.nowFn()
 	if !c.lastAttempt.IsZero() && c.backoff > 0 && now.Sub(c.lastAttempt) < c.backoff {
-		return fmt.Errorf("re-enroll backed off (%s remaining)", (c.backoff - now.Sub(c.lastAttempt)).Round(time.Millisecond))
+		rem := (c.backoff - now.Sub(c.lastAttempt)).Round(time.Millisecond)
+		c.mu.Unlock()
+		return fmt.Errorf("re-enroll backed off (%s remaining)", rem)
 	}
 
 	c.lastAttempt = now
-	tok, cid, err := c.enrollFn(c.apiURL, c.enrollToken, c.cluster)
+	flight := &reenrollFlight{done: make(chan struct{})}
+	c.flight = flight
+	apiURL := c.apiURL
+	enrollToken := c.enrollToken
+	cluster := c.cluster
+	enrollFn := c.enrollFn
+	c.mu.Unlock()
+
+	tok, cid, err := enrollFn(apiURL, enrollToken, cluster)
+
+	c.mu.Lock()
+	var retErr error
 	if err != nil {
 		if isAuthRejected(err) {
 			c.enrollRejected = true
-			return fmt.Errorf("re-enroll halted: enroll token rejected: %w", err)
-		}
-		if c.backoff == 0 {
-			c.backoff = time.Second
+			retErr = fmt.Errorf("re-enroll halted: enroll token rejected: %w", err)
 		} else {
-			c.backoff *= 2
-			if c.backoff > 30*time.Second {
-				c.backoff = 30 * time.Second
+			if c.backoff == 0 {
+				c.backoff = time.Second
+			} else {
+				c.backoff *= 2
+				if c.backoff > 30*time.Second {
+					c.backoff = 30 * time.Second
+				}
 			}
+			retErr = err
 		}
-		return err
+	} else {
+		c.token = tok
+		c.clusterID = cid
+		c.tokenGen++
+		c.backoff = 0
+		c.enrollRejected = false
+		log.Printf("re-enrolled connector cluster=%s", cid)
 	}
-
-	c.token = tok
-	c.clusterID = cid
-	c.backoff = 0
-	c.enrollRejected = false
-	log.Printf("re-enrolled connector cluster=%s", cid)
-	return nil
+	flight.err = retErr
+	c.flight = nil
+	close(flight.done)
+	c.mu.Unlock()
+	return retErr
 }
 
 func requireLocalAuth(expectedToken string, authDisabled bool, next http.HandlerFunc) http.HandlerFunc {
@@ -460,7 +632,10 @@ func getActiveAttest(apiURL, token string) (*types.PendingAttest, error) {
 	if res.StatusCode == http.StatusNoContent {
 		return nil, nil
 	}
-	data, _ := io.ReadAll(res.Body)
+	data, err := readBodyBounded(res.Body, maxResponseBodyBytes)
+	if err != nil {
+		return nil, err
+	}
 	if res.StatusCode >= 300 {
 		return nil, &httpError{code: res.StatusCode, body: string(data)}
 	}
@@ -493,7 +668,10 @@ func postJSON(url, token string, body any, out any) error {
 		return err
 	}
 	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
+	data, err := readBodyBounded(res.Body, maxResponseBodyBytes)
+	if err != nil {
+		return err
+	}
 	if res.StatusCode >= 300 {
 		return &httpError{code: res.StatusCode, body: string(data)}
 	}
@@ -516,11 +694,25 @@ func getJSON(url, token string, out any) error {
 		return err
 	}
 	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
+	data, err := readBodyBounded(res.Body, maxResponseBodyBytes)
+	if err != nil {
+		return err
+	}
 	if res.StatusCode >= 300 {
 		return &httpError{code: res.StatusCode, body: string(data)}
 	}
 	return json.Unmarshal(data, out)
+}
+
+func readBodyBounded(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d byte limit", limit)
+	}
+	return data, nil
 }
 
 type httpError struct {
@@ -536,9 +728,9 @@ func isUnauthorized(err error) bool {
 	}
 	var he *httpError
 	if errors.As(err, &he) {
-		return he.code == http.StatusUnauthorized || strings.Contains(he.body, "unauthorized")
+		return he.code == http.StatusUnauthorized
 	}
-	return strings.Contains(err.Error(), "unauthorized")
+	return false
 }
 
 func isAuthRejected(err error) bool {
@@ -550,6 +742,18 @@ func isAuthRejected(err error) bool {
 		return he.code == http.StatusUnauthorized || he.code == http.StatusForbidden
 	}
 	return false
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil || host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func decodeLocalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {

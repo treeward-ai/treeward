@@ -243,6 +243,10 @@ type ShirudoRuntime struct {
 	loggedExternal map[string]bool
 }
 
+func noRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 // NewShirudo constructs a ShirudoRuntime configured from environment variables
 // (SHIRUDO_RUNTIME_BIN, NODE_NAME/HOSTNAME, SHIRUDO_UPATCH_DIR, SHIRUDO_STATE_DIR,
 // SHIRUDO_EVENTLOG_PATH, TREEWARD_ROLLOUT, TREEWARD_CONNECTOR_URL, TREEWARD_LOCAL_TOKEN)
@@ -264,7 +268,7 @@ func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 		rollout:        strings.TrimSpace(os.Getenv("TREEWARD_ROLLOUT")),
 		connectorURL:   strings.TrimRight(strings.TrimSpace(os.Getenv("TREEWARD_CONNECTOR_URL")), "/"),
 		localToken:     os.Getenv("TREEWARD_LOCAL_TOKEN"),
-		httpClient:     &http.Client{Timeout: defaultDownloadTimeout},
+		httpClient:     &http.Client{Timeout: defaultDownloadTimeout, CheckRedirect: noRedirect},
 		owned:          map[string]string{},
 		loggedExternal: map[string]bool{},
 	}
@@ -602,7 +606,7 @@ func (s *ShirudoRuntime) ensureUnloadDirectiveFile(directivePath, name, recorded
 func (s *ShirudoRuntime) downloadAndVerify(url, destPath, fallbackSHA string, preferHeaderSHA bool) error {
 	client := s.httpClient
 	if client == nil {
-		client = &http.Client{Timeout: defaultDownloadTimeout}
+		client = &http.Client{Timeout: defaultDownloadTimeout, CheckRedirect: noRedirect}
 	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
