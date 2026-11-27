@@ -135,6 +135,8 @@ func main() {
 		writeJSON(w, p)
 	}))
 
+	registerUpatchRoutes(mux, apiURL, creds, localToken, localAuthDisabled)
+
 	mux.HandleFunc("POST /v1/local/attest", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
 		var results []types.AttestResult
 		if !decodeLocalJSON(w, r, &results) {
