@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	shirudoBin := flag.String("shirudo-bin", os.Getenv("SHIRUDO_BIN"), "path to shirudo binary for attestation verification (empty preserves mock behavior)")
+	shirudoBin := flag.String("shirudo-bin", os.Getenv("SHIRUDO_BIN"), "path to shirudo binary for attestation verification (empty fails closed unless TREEWARD_ALLOW_STUB_ATTEST=true)")
 	shirudoAKName := flag.String("shirudo-ak-name", os.Getenv("SHIRUDO_AK_NAME"), "default AK name hex for shirudo attest verify")
 	shirudoExpectConfigRoot := flag.String("shirudo-expect-config-root", os.Getenv("SHIRUDO_EXPECT_CONFIG_ROOT"), "optional --expect-config-root for shirudo attest verify")
 	shirudoExpectConfigPCR := flag.String("shirudo-expect-config-pcr", os.Getenv("SHIRUDO_EXPECT_CONFIG_PCR"), "optional --expect-config-pcr for shirudo attest verify")
@@ -61,6 +61,10 @@ func main() {
 		st.AllowSelfApprove = true
 		log.Printf("WARNING: TREEWARD_ALLOW_SELF_APPROVE=true — two-person approval separation of duties is DISABLED (dev/demo only)")
 	}
+	if envTrue(os.Getenv("TREEWARD_ALLOW_STUB_ATTEST")) {
+		st.AllowStubAttest = true
+		log.Printf("WARNING: TREEWARD_ALLOW_STUB_ATTEST=true — stub attestation verification is ENABLED (dev/demo only; quotes are NOT cryptographically verified)")
+	}
 	if *shirudoBin != "" {
 		cfg := api.ShirudoVerifierConfigFromEnv()
 		cfg.Bin = *shirudoBin
@@ -69,6 +73,8 @@ func main() {
 		cfg.ExpectConfigPCR = *shirudoExpectConfigPCR
 		srv.Verifier = api.NewShirudoVerifier(cfg)
 		log.Printf("shirudo attest verifier enabled (bin=%s)", *shirudoBin)
+	} else if !st.AllowStubAttest {
+		log.Printf("attest verifier not configured (SHIRUDO_BIN unset); attestation results will fail closed as unverified failures unless TREEWARD_ALLOW_STUB_ATTEST=true")
 	}
 	httpSrv := &http.Server{
 		Addr:              addr,

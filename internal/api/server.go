@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/treeward-ai/treeward/internal/store"
@@ -32,6 +33,9 @@ func New(st *store.Store) *Server {
 	}
 	if v := NewShirudoVerifierFromEnv(); v != nil {
 		s.Verifier = v
+	}
+	if st != nil && parseEnvBool(os.Getenv("TREEWARD_ALLOW_STUB_ATTEST"), false) {
+		st.AllowStubAttest = true
 	}
 	s.routes()
 	return s
@@ -308,6 +312,10 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, store.ErrSelfApproveForbidden) {
 			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		if errors.Is(err, store.ErrInvalidTransition) {
+			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadRequest)

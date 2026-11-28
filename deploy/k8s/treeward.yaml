@@ -15,28 +15,75 @@
 #          TREEWARD_ADMIN_BOOTSTRAP_TOKEN.
 #        - NEVER mounted into treeward-connector or treeward-agent.
 #
-#   3. Secret/treeward-local (key: token)
-#      Shared bearer token protecting the connector's local HTTP endpoints
-#      (/v1/local/*) between:
-#        - treeward-connector (server, TREEWARD_LOCAL_TOKEN)
-#        - treeward-agent (client, TREEWARD_LOCAL_TOKEN)
+#   3. Agent-to-connector auth (per-node Kubernetes projected SA tokens):
+#      In Kubernetes, treeward-agent mounts a short-lived projected
+#      ServiceAccount token (audience: treeward-connector, expiry: 600s) and
+#      re-reads it on each request via TREEWARD_AGENT_TOKEN_FILE.
+#      treeward-connector runs with TREEWARD_LOCAL_AUTH=k8s, validates each
+#      token via TokenReview (matching audience), looks up the bound pod's
+#      spec.nodeName, and rejects /v1/local/report or /v1/local/attest payloads
+#      whose node identity does not match (403 Forbidden).
+#      (For non-Kubernetes VM installs, shared-token mode via
+#      TREEWARD_LOCAL_TOKEN remains supported.)
 #
-# `make quickstart` creates all three Secrets automatically with distinct random
-# values stored in `.treeward/quickstart.env` (mode 0600, gitignored). To create
-# them manually:
+#   4. TLS between agent and connector (follow-up for full in-cluster PKI):
+#      treeward-connector supports TLS 1.3 natively when TREEWARD_TLS_CERT and
+#      TREEWARD_TLS_KEY are mounted from a Kubernetes TLS Secret (e.g. managed
+#      by cert-manager) and agents point TREEWARD_CONNECTOR_URL at
+#      https://treeward-connector:8090. Full automated in-cluster TLS / custom
+#      CA trust provisioning for agents is tracked as a follow-up.
+#
+# `make quickstart` creates the required Secrets automatically with distinct
+# random values stored in `.treeward/quickstart.env` (mode 0600, gitignored).
+# To create them manually:
 #
 #   kubectl create namespace treeward --dry-run=client -o yaml | kubectl apply -f -
 #   kubectl -n treeward create secret generic treeward-enroll \
 #     --from-literal=token="$(openssl rand -hex 32)"
 #   kubectl -n treeward create secret generic treeward-admin-bootstrap \
 #     --from-literal=token="$(openssl rand -hex 32)"
-#   kubectl -n treeward create secret generic treeward-local \
-#     --from-literal=token="$(openssl rand -hex 32)"
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: treeward
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: treeward-connector
+  namespace: treeward
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: treeward-agent
+  namespace: treeward
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: treeward-connector-auth
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: treeward-connector-auth
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: treeward-connector-auth
+subjects:
+  - kind: ServiceAccount
+    name: treeward-connector
+    namespace: treeward
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -161,6 +208,10 @@ spec:
               value: /var/treeward/keys
             - name: TREEWARD_DATA_DIR
               value: /var/treeward/data
+            # Dev/quickstart demo only: allows stub attestation quotes without SHIRUDO_BIN.
+            # Remove in production and configure SHIRUDO_BIN (treeward-api fails closed by default).
+            - name: TREEWARD_ALLOW_STUB_ATTEST
+              value: "true"
             # Two-person separation of duties is enforced by default (binding creator cannot
             # approve their own binding). `make quickstart` mints distinct operator and approver
             # tokens; set TREEWARD_ALLOW_SELF_APPROVE=true only for single-operator dev setups.
@@ -216,7 +267,8 @@ spec:
       labels:
         app: treeward-connector
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: treeward-connector
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -250,11 +302,14 @@ spec:
                 secretKeyRef:
                   name: treeward-enroll
                   key: token
-            - name: TREEWARD_LOCAL_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: treeward-local
-                  key: token
+            - name: TREEWARD_LOCAL_AUTH
+              value: "k8s"
+            - name: TREEWARD_K8S_AUDIENCE
+              value: "treeward-connector"
+            # Dev/quickstart demo only: stub runtime reports 3 virtual nodes (<node>-canary, -n1, -n2).
+            # Remove for production Shirudo deployments so only exact spec.nodeName matches are accepted.
+            - name: TREEWARD_K8S_ALLOW_STUB_NODES
+              value: "true"
             - name: TREEWARD_CLUSTER
               value: kind-treeward-quickstart
             # Bind all interfaces inside the pod so kube-proxy/Service traffic reaches the connector.
@@ -283,6 +338,7 @@ spec:
       labels:
         app: treeward-agent
     spec:
+      serviceAccountName: treeward-agent
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -314,12 +370,21 @@ spec:
               value: "stub"
             - name: TREEWARD_CONNECTOR_URL
               value: http://treeward-connector:8090
-            - name: TREEWARD_LOCAL_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: treeward-local
-                  key: token
+            - name: TREEWARD_AGENT_TOKEN_FILE
+              value: /var/run/secrets/treeward/token
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          volumeMounts:
+            - name: connector-token
+              mountPath: /var/run/secrets/treeward
+              readOnly: true
+      volumes:
+        - name: connector-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: treeward-connector
+                  expirationSeconds: 600
+                  path: token

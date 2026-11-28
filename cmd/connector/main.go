@@ -251,15 +251,45 @@ func main() {
 	cluster := env("TREEWARD_CLUSTER", "kind-treeward")
 	listen := connectorListenAddr()
 	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
-	localAuthDisabled := strings.EqualFold(os.Getenv("TREEWARD_LOCAL_AUTH"), "off")
-	if localToken == "" {
-		if !localAuthDisabled {
-			log.Fatal("TREEWARD_LOCAL_TOKEN is required (set TREEWARD_LOCAL_AUTH=off for local dev only)")
+	localAuthMode := strings.ToLower(strings.TrimSpace(os.Getenv("TREEWARD_LOCAL_AUTH")))
+	var wrapAuth func(http.HandlerFunc) http.HandlerFunc
+	allowStubNodes := false
+
+	switch localAuthMode {
+	case "", "token":
+		if localToken == "" {
+			log.Fatal("TREEWARD_LOCAL_TOKEN is required (or set TREEWARD_LOCAL_AUTH=k8s in Kubernetes, or TREEWARD_LOCAL_AUTH=off on loopback for local dev only)")
 		}
-		if !isLoopbackListenAddr(listen) {
-			log.Fatalf("refusing to start with TREEWARD_LOCAL_AUTH=off on non-loopback address %q (bind to 127.0.0.1, ::1, or localhost, or set TREEWARD_LOCAL_TOKEN)", listen)
+		wrapAuth = func(next http.HandlerFunc) http.HandlerFunc {
+			return requireLocalAuth(localToken, false, next)
 		}
-		log.Printf("WARNING: TREEWARD_LOCAL_AUTH=off and TREEWARD_LOCAL_TOKEN is empty; local connector endpoints are unauthenticated (local dev only)")
+	case "off":
+		if localToken != "" {
+			wrapAuth = func(next http.HandlerFunc) http.HandlerFunc {
+				return requireLocalAuth(localToken, false, next)
+			}
+		} else {
+			if !isLoopbackListenAddr(listen) {
+				log.Fatalf("refusing to start with TREEWARD_LOCAL_AUTH=off on non-loopback address %q (bind to 127.0.0.1, ::1, or localhost, or set TREEWARD_LOCAL_TOKEN / TREEWARD_LOCAL_AUTH=k8s)", listen)
+			}
+			log.Printf("WARNING: TREEWARD_LOCAL_AUTH=off and TREEWARD_LOCAL_TOKEN is empty; local connector endpoints are unauthenticated (local dev only)")
+			wrapAuth = func(next http.HandlerFunc) http.HandlerFunc {
+				return requireLocalAuth("", true, next)
+			}
+		}
+	case "k8s":
+		k8sAuth, err := newK8sAuthenticatorFromEnv()
+		if err != nil {
+			log.Fatalf("TREEWARD_LOCAL_AUTH=k8s init failed: %v", err)
+		}
+		wrapAuth = k8sAuth.Middleware
+		if envTrue(os.Getenv("TREEWARD_K8S_ALLOW_STUB_NODES")) {
+			allowStubNodes = true
+			log.Printf("WARNING: TREEWARD_K8S_ALLOW_STUB_NODES=true — allowing stub node suffixes (-canary, -n1, -n2) under bound nodeName (dev/quickstart demo only)")
+		}
+		log.Printf("local auth enabled: Kubernetes TokenReview (audience=%s)", k8sAuth.audience)
+	default:
+		log.Fatalf("invalid TREEWARD_LOCAL_AUTH %q (expected token, k8s, or off)", localAuthMode)
 	}
 	interval := 5 * time.Second
 
@@ -271,89 +301,7 @@ func main() {
 	log.Printf("enrolled connector cluster=%s", clusterID)
 
 	state := newConnectorState()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	mux.HandleFunc("POST /v1/local/report", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
-		var reports []types.AgentReport
-		if !decodeLocalJSON(w, r, &reports) {
-			return
-		}
-		_, cid := creds.snapshot()
-		state.recordReports(cid, reports)
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	mux.HandleFunc("GET /v1/local/desired", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, _ *http.Request) {
-		tok, _ := creds.snapshot()
-		desired, err := getDesired(apiURL, tok)
-		if err != nil {
-			if isUnauthorized(err) {
-				if rerr := creds.reenroll(tok); rerr != nil {
-					log.Printf("re-enroll: %v", rerr)
-				} else {
-					tok, _ = creds.snapshot()
-					desired, err = getDesired(apiURL, tok)
-				}
-			}
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-		}
-		writeJSON(w, desired)
-	}))
-
-	mux.HandleFunc("GET /v1/local/attest", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, _ *http.Request) {
-		p := state.getPending()
-		if p == nil {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		writeJSON(w, p)
-	}))
-
-	registerUpatchRoutes(mux, apiURL, creds, localToken, localAuthDisabled)
-
-	mux.HandleFunc("POST /v1/local/attest", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
-		var results []types.AttestResult
-		if !decodeLocalJSON(w, r, &results) {
-			return
-		}
-		campID, batch, shouldSubmit, hasPending := state.recordAttestResults(results)
-		if !hasPending {
-			http.Error(w, "no active campaign", http.StatusConflict)
-			return
-		}
-
-		if shouldSubmit {
-			resultsURL := fmt.Sprintf("%s/v1/attest/campaigns/%s/results", apiURL, url.PathEscape(campID))
-			tok, _ := creds.snapshot()
-			if err := postJSON(resultsURL, tok, batch, nil); err != nil {
-				if isUnauthorized(err) {
-					if rerr := creds.reenroll(tok); rerr != nil {
-						log.Printf("re-enroll: %v", rerr)
-					} else {
-						tok, _ = creds.snapshot()
-						err = postJSON(resultsURL, tok, batch, nil)
-					}
-				}
-				if err != nil {
-					state.finishAttestSubmit(campID, false)
-					log.Printf("attest submit: %v", err)
-					http.Error(w, err.Error(), http.StatusBadGateway)
-					return
-				}
-			}
-			state.finishAttestSubmit(campID, true)
-			log.Printf("attest campaign %s submitted (%d quotes)", campID, len(batch))
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
+	mux := newConnectorMux(apiURL, creds, state, wrapAuth, allowStubNodes)
 
 	go func() {
 		t := time.NewTicker(interval)
@@ -784,4 +732,116 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envTrue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func newConnectorMux(apiURL string, creds *credManager, state *connectorState, wrapAuth func(http.HandlerFunc) http.HandlerFunc, allowStubNodes bool) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	mux.HandleFunc("POST /v1/local/report", wrapAuth(func(w http.ResponseWriter, r *http.Request) {
+		var reports []types.AgentReport
+		if !decodeLocalJSON(w, r, &reports) {
+			return
+		}
+		if boundNode, ok := k8sNodeFromContext(r.Context()); ok {
+			for _, rep := range reports {
+				if !matchesBoundNode(rep.Node.ID, boundNode, allowStubNodes) {
+					http.Error(w, "forbidden: node identity mismatch", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		_, cid := creds.snapshot()
+		state.recordReports(cid, reports)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	mux.HandleFunc("GET /v1/local/desired", wrapAuth(func(w http.ResponseWriter, _ *http.Request) {
+		tok, _ := creds.snapshot()
+		desired, err := getDesired(apiURL, tok)
+		if err != nil {
+			if isUnauthorized(err) {
+				if rerr := creds.reenroll(tok); rerr != nil {
+					log.Printf("re-enroll: %v", rerr)
+				} else {
+					tok, _ = creds.snapshot()
+					desired, err = getDesired(apiURL, tok)
+				}
+			}
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+		}
+		writeJSON(w, desired)
+	}))
+
+	mux.HandleFunc("GET /v1/local/attest", wrapAuth(func(w http.ResponseWriter, _ *http.Request) {
+		p := state.getPending()
+		if p == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeJSON(w, p)
+	}))
+
+	registerUpatchRoutesWithAuth(mux, apiURL, creds, wrapAuth)
+
+	mux.HandleFunc("POST /v1/local/attest", wrapAuth(func(w http.ResponseWriter, r *http.Request) {
+		var results []types.AttestResult
+		if !decodeLocalJSON(w, r, &results) {
+			return
+		}
+		if boundNode, ok := k8sNodeFromContext(r.Context()); ok {
+			for _, res := range results {
+				if !matchesBoundNode(res.NodeID, boundNode, allowStubNodes) {
+					http.Error(w, "forbidden: node identity mismatch", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		campID, batch, shouldSubmit, hasPending := state.recordAttestResults(results)
+		if !hasPending {
+			http.Error(w, "no active campaign", http.StatusConflict)
+			return
+		}
+
+		if shouldSubmit {
+			resultsURL := fmt.Sprintf("%s/v1/attest/campaigns/%s/results", apiURL, url.PathEscape(campID))
+			tok, _ := creds.snapshot()
+			if err := postJSON(resultsURL, tok, batch, nil); err != nil {
+				if isUnauthorized(err) {
+					if rerr := creds.reenroll(tok); rerr != nil {
+						log.Printf("re-enroll: %v", rerr)
+					} else {
+						tok, _ = creds.snapshot()
+						err = postJSON(resultsURL, tok, batch, nil)
+					}
+				}
+				if err != nil {
+					state.finishAttestSubmit(campID, false)
+					log.Printf("attest submit: %v", err)
+					http.Error(w, err.Error(), http.StatusBadGateway)
+					return
+				}
+			}
+			state.finishAttestSubmit(campID, true)
+			log.Printf("attest campaign %s submitted (%d quotes)", campID, len(batch))
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	return mux
 }

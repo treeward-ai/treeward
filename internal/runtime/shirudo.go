@@ -199,6 +199,14 @@ func WithLocalToken(token string) ShirudoOption {
 	}
 }
 
+// WithLocalTokenFile sets a file path re-read on each request for the bearer
+// token (e.g. a rotated Kubernetes projected ServiceAccount token).
+func WithLocalTokenFile(path string) ShirudoOption {
+	return func(s *ShirudoRuntime) {
+		s.localTokenFile = strings.TrimSpace(path)
+	}
+}
+
 // WithHTTPClient overrides the HTTP client used for upatch downloads.
 func WithHTTPClient(client *http.Client) ShirudoOption {
 	return func(s *ShirudoRuntime) {
@@ -237,6 +245,7 @@ type ShirudoRuntime struct {
 	rollout        string
 	connectorURL   string
 	localToken     string
+	localTokenFile string
 	httpClient     *http.Client
 	ownedLoaded    bool
 	owned          map[string]string
@@ -268,6 +277,7 @@ func NewShirudo(opts ...ShirudoOption) *ShirudoRuntime {
 		rollout:        strings.TrimSpace(os.Getenv("TREEWARD_ROLLOUT")),
 		connectorURL:   strings.TrimRight(strings.TrimSpace(os.Getenv("TREEWARD_CONNECTOR_URL")), "/"),
 		localToken:     os.Getenv("TREEWARD_LOCAL_TOKEN"),
+		localTokenFile: strings.TrimSpace(os.Getenv("TREEWARD_AGENT_TOKEN_FILE")),
 		httpClient:     &http.Client{Timeout: defaultDownloadTimeout, CheckRedirect: noRedirect},
 		owned:          map[string]string{},
 		loggedExternal: map[string]bool{},
@@ -612,7 +622,17 @@ func (s *ShirudoRuntime) downloadAndVerify(url, destPath, fallbackSHA string, pr
 	if err != nil {
 		return fmt.Errorf("download %s: %w", url, err)
 	}
-	if s.localToken != "" {
+	if s.localTokenFile != "" {
+		tokBytes, err := os.ReadFile(s.localTokenFile)
+		if err != nil {
+			return fmt.Errorf("download %s: read agent token file %q: %w", url, s.localTokenFile, err)
+		}
+		tok := strings.TrimSpace(string(tokBytes))
+		if tok == "" {
+			return fmt.Errorf("download %s: agent token file %q is empty", url, s.localTokenFile)
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+	} else if s.localToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.localToken)
 	}
 	res, err := client.Do(req)
