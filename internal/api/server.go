@@ -2,14 +2,19 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
 
+	"github.com/treeward-ai/treeward/internal/runtime"
 	"github.com/treeward-ai/treeward/internal/store"
 	"github.com/treeward-ai/treeward/internal/types"
 )
@@ -58,6 +63,8 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/nodes", s.withRoles(s.handleListNodes, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
 	s.Mux.HandleFunc("POST /v1/artifacts", s.withRoles(s.handleCreateArtifact, types.RoleOperator, types.RoleAdmin))
 	s.Mux.HandleFunc("GET /v1/artifacts", s.withRoles(s.handleListArtifacts, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("GET /v1/upatches/{sha}", s.withConnector(s.handleGetUpatch))
+	s.Mux.HandleFunc("GET /v1/upatches/{sha}/unload", s.withConnector(s.handleGetUpatchUnload))
 	s.Mux.HandleFunc("POST /v1/bindings", s.withRoles(s.handleCreateBinding, types.RoleOperator, types.RoleAdmin))
 	s.Mux.HandleFunc("GET /v1/bindings", s.withRoles(s.handleListBindings, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
 	s.Mux.HandleFunc("GET /v1/bindings/{id}", s.withRoles(s.handleGetBinding, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
@@ -263,12 +270,106 @@ func (s *Server) handleListNodes(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Store.ListNodes())
 }
 
+// createArtifactRequest is the artifact metadata plus, for bpf artifacts, the
+// signed upatch and its unload directive as standard base64. When the bytes are
+// present the digest is derived from them ("<name>@sha256:<upatch sha256>") and
+// the connector can then serve them to agents.
+type createArtifactRequest struct {
+	types.Artifact
+	UpatchB64       string `json:"upatchB64,omitempty"`
+	UpatchUnloadB64 string `json:"upatchUnloadB64,omitempty"`
+}
+
 func (s *Server) handleCreateArtifact(w http.ResponseWriter, r *http.Request) {
-	var a types.Artifact
-	if !decodeJSON(w, r, &a) {
+	var req createArtifactRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
-	writeJSON(w, http.StatusCreated, s.Store.CreateArtifactBy(a, actorFromRequest(r, "api")))
+	actor := actorFromRequest(r, "api")
+	if req.UpatchB64 == "" && req.UpatchUnloadB64 == "" {
+		writeJSON(w, http.StatusCreated, s.Store.CreateArtifactBy(req.Artifact, actor))
+		return
+	}
+	a, upatch, unload, err := registerUpatchArtifact(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	out, err := s.Store.CreateUpatchArtifactBy(a, upatch, unload, actor)
+	if errors.Is(err, store.ErrDuplicateArtifact) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+// registerUpatchArtifact decodes and checks the signed bytes of a bpf artifact
+// and derives its digest from them.
+func registerUpatchArtifact(req createArtifactRequest) (types.Artifact, []byte, []byte, error) {
+	if req.Type != "" && req.Type != "bpf" {
+		return types.Artifact{}, nil, nil, fmt.Errorf("upatch bytes are only accepted for type bpf")
+	}
+	if req.UpatchB64 == "" || req.UpatchUnloadB64 == "" {
+		return types.Artifact{}, nil, nil, fmt.Errorf("upatchB64 and upatchUnloadB64 must both be set")
+	}
+	upatch, err := base64.StdEncoding.DecodeString(req.UpatchB64)
+	if err != nil || len(upatch) == 0 {
+		return types.Artifact{}, nil, nil, fmt.Errorf("upatchB64 must be non-empty standard base64")
+	}
+	unload, err := base64.StdEncoding.DecodeString(req.UpatchUnloadB64)
+	if err != nil || len(unload) == 0 {
+		return types.Artifact{}, nil, nil, fmt.Errorf("upatchUnloadB64 must be non-empty standard base64")
+	}
+	upSum := sha256.Sum256(upatch)
+	unSum := sha256.Sum256(unload)
+	upSHA := hex.EncodeToString(upSum[:])
+	digest := req.Name + "@sha256:" + upSHA
+	// Same validation the Shirudo runtime applies to desired entries.
+	if _, err := runtime.ParseDesiredUpatch(digest); err != nil {
+		return types.Artifact{}, nil, nil, err
+	}
+	if req.Digest != "" && req.Digest != digest {
+		return types.Artifact{}, nil, nil, fmt.Errorf("digest must be omitted or equal to %s", digest)
+	}
+	a := req.Artifact
+	a.Type = "bpf"
+	a.Digest = digest
+	a.UpatchSHA256 = upSHA
+	a.UnloadSHA256 = hex.EncodeToString(unSum[:])
+	return a, upatch, unload, nil
+}
+
+// handleGetUpatch serves the signed upatch registered under {sha} to a connector.
+func (s *Server) handleGetUpatch(w http.ResponseWriter, r *http.Request) {
+	s.serveUpatch(w, r, false)
+}
+
+// handleGetUpatchUnload serves the unload directive of the upatch registered under {sha}.
+func (s *Server) handleGetUpatchUnload(w http.ResponseWriter, r *http.Request) {
+	s.serveUpatch(w, r, true)
+}
+
+func (s *Server) serveUpatch(w http.ResponseWriter, r *http.Request, unload bool) {
+	sha := strings.ToLower(r.PathValue("sha"))
+	if b, err := hex.DecodeString(sha); err != nil || len(b) != sha256.Size {
+		http.Error(w, "invalid_sha256", http.StatusBadRequest)
+		return
+	}
+	body, ok := s.Store.UpatchBytes(sha, unload)
+	if !ok {
+		http.Error(w, "upatch not found", http.StatusNotFound)
+		return
+	}
+	sum := sha256.Sum256(body)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("x-upatch-sha256", hex.EncodeToString(sum[:]))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) handleListArtifacts(w http.ResponseWriter, _ *http.Request) {

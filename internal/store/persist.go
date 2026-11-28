@@ -22,6 +22,7 @@ type snapshot struct {
 	Tree       []types.TreeOp                   `json:"tree"`
 	Audit      []types.AuditEvent               `json:"audit"`
 	Campaigns  map[string]*types.AttestCampaign `json:"campaigns"`
+	Upatches   map[string]*upatchBlob           `json:"upatches,omitempty"`
 }
 
 // Open loads (or creates) a SQLite-backed store at dbPath.
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 		Artifacts:           map[string]*types.Artifact{},
 		Bindings:            map[string]*types.Binding{},
 		Campaigns:           map[string]*types.AttestCampaign{},
+		Upatches:            map[string]*upatchBlob{},
 		tokens:              map[string]*storedToken{},
 	}
 	if err := s.load(); err != nil {
@@ -162,6 +164,9 @@ func (s *Store) load() error {
 	if snap.Campaigns != nil {
 		s.Campaigns = snap.Campaigns
 	}
+	if snap.Upatches != nil {
+		s.Upatches = snap.Upatches
+	}
 	return s.loadTokens()
 }
 
@@ -178,6 +183,7 @@ func (s *Store) persistLocked() {
 		Tree:       s.Tree,
 		Audit:      s.Audit,
 		Campaigns:  s.Campaigns,
+		Upatches:   s.Upatches,
 	}
 	raw, err := json.Marshal(snap)
 	if err != nil {

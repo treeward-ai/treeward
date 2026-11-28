@@ -45,6 +45,7 @@ type Store struct {
 	Tree       []types.TreeOp
 	Audit      []types.AuditEvent
 	Campaigns  map[string]*types.AttestCampaign
+	Upatches   map[string]*upatchBlob  // by upatch file sha256
 	tokens     map[string]*storedToken // by token ID
 }
 
@@ -59,6 +60,7 @@ func New(enrollToken, adminBootstrapToken string, s signer.Signer) *Store {
 		Artifacts:           map[string]*types.Artifact{},
 		Bindings:            map[string]*types.Binding{},
 		Campaigns:           map[string]*types.AttestCampaign{},
+		Upatches:            map[string]*upatchBlob{},
 		tokens:              map[string]*storedToken{},
 	}
 }
