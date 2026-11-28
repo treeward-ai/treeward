@@ -17,10 +17,16 @@ const maxUpatchBytes = 16 << 20
 // GET /v1/upatches/{sha}/unload on the connector; the connector forwards them to
 // the control plane with its enrolled credential, so the VM never holds one.
 func registerUpatchRoutes(mux *http.ServeMux, apiURL string, creds *credManager, localToken string, localAuthDisabled bool) {
-	mux.HandleFunc("GET /v1/upatches/{sha}", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
+	registerUpatchRoutesWithAuth(mux, apiURL, creds, func(next http.HandlerFunc) http.HandlerFunc {
+		return requireLocalAuth(localToken, localAuthDisabled, next)
+	})
+}
+
+func registerUpatchRoutesWithAuth(mux *http.ServeMux, apiURL string, creds *credManager, wrapAuth func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("GET /v1/upatches/{sha}", wrapAuth(func(w http.ResponseWriter, r *http.Request) {
 		proxyUpatch(w, apiURL, creds, r.PathValue("sha"), "")
 	}))
-	mux.HandleFunc("GET /v1/upatches/{sha}/unload", requireLocalAuth(localToken, localAuthDisabled, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/upatches/{sha}/unload", wrapAuth(func(w http.ResponseWriter, r *http.Request) {
 		proxyUpatch(w, apiURL, creds, r.PathValue("sha"), "/unload")
 	}))
 }

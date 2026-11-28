@@ -34,7 +34,10 @@ func main() {
 	flag.Parse()
 
 	connector := env("TREEWARD_CONNECTOR_URL", "http://treeward-connector:8090")
-	localToken := os.Getenv("TREEWARD_LOCAL_TOKEN")
+	tokSrc := tokenSource{
+		file:  strings.TrimSpace(os.Getenv("TREEWARD_AGENT_TOKEN_FILE")),
+		fixed: os.Getenv("TREEWARD_LOCAL_TOKEN"),
+	}
 	kind := *runtimeFlag
 	treePubKey, verifyWarning, err := resolveTreeVerifyConfig(kind, os.Getenv("TREEWARD_VERIFY_TREE"), os.Getenv("TREEWARD_TREE_PUBKEY"))
 	if err != nil {
@@ -48,7 +51,8 @@ func main() {
 	if strings.EqualFold(strings.TrimSpace(kind), "shirudo") {
 		rt = runtime.NewShirudo(
 			runtime.WithConnectorURL(connector),
-			runtime.WithLocalToken(localToken),
+			runtime.WithLocalToken(tokSrc.fixed),
+			runtime.WithLocalTokenFile(tokSrc.file),
 		)
 	} else {
 		rt, err = runtime.New(kind)
@@ -62,7 +66,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("inventory: %v", err)
 	}
-	log.Printf("agent starting runtime=%s nodes=%d verify_tree=%v → %s", kind, len(nodes), treePubKey != "", connector)
+	log.Printf("agent starting runtime=%s nodes=%d verify_tree=%v token_file=%v → %s", kind, len(nodes), treePubKey != "", tokSrc.file != "", connector)
 
 	var lastAttest string
 	var lastVerifiedSeq int64
@@ -72,8 +76,9 @@ func main() {
 		var loaded map[string][]string
 		var applyErrs map[string][]string
 
-		desired, err := getDesired(connector, localToken)
-		if err != nil {
+		if tok, err := tokSrc.Token(); err != nil {
+			log.Printf("desired token: %v", err)
+		} else if desired, err := getDesired(connector, tok); err != nil {
 			log.Printf("desired: %v", err)
 		} else {
 			loaded, applyErrs, lastVerifiedSeq, err = applyDesiredState(rt, treePubKey, lastVerifiedSeq, desired, nodes)
@@ -109,11 +114,15 @@ func main() {
 			reports = append(reports, rep)
 		}
 
-		if err := postReport(connector, localToken, reports); err != nil {
+		if tok, err := tokSrc.Token(); err != nil {
+			log.Printf("report token: %v", err)
+		} else if err := postReport(connector, tok, reports); err != nil {
 			log.Printf("report: %v", err)
 		}
 
-		if pending, err := getPendingAttest(connector, localToken); err != nil {
+		if tok, err := tokSrc.Token(); err != nil {
+			log.Printf("attest poll token: %v", err)
+		} else if pending, err := getPendingAttest(connector, tok); err != nil {
 			log.Printf("attest poll: %v", err)
 		} else if pending != nil && pending.ID != lastAttest {
 			loadedForAttest := map[string][]string{}
@@ -123,7 +132,9 @@ func main() {
 			quotes, err := rt.Attest(pending.Nonce, nodes, loadedForAttest)
 			if err != nil {
 				log.Printf("attest: %v", err)
-			} else if err := postAttest(connector, localToken, quotes); err != nil {
+			} else if tok, err := tokSrc.Token(); err != nil {
+				log.Printf("attest submit token: %v", err)
+			} else if err := postAttest(connector, tok, quotes); err != nil {
 				log.Printf("attest submit: %v", err)
 			} else {
 				log.Printf("attest submitted campaign=%s nodes=%d", pending.ID, len(quotes))
@@ -133,6 +144,29 @@ func main() {
 
 		<-t.C
 	}
+}
+
+// tokenSource resolves the bearer token sent to the connector. When file is
+// set (TREEWARD_AGENT_TOKEN_FILE), it is re-read on every call so rotated
+// Kubernetes projected ServiceAccount tokens are picked up automatically.
+type tokenSource struct {
+	file  string
+	fixed string
+}
+
+func (ts tokenSource) Token() (string, error) {
+	if ts.file != "" {
+		data, err := os.ReadFile(ts.file)
+		if err != nil {
+			return "", fmt.Errorf("read agent token file %q: %w", ts.file, err)
+		}
+		tok := strings.TrimSpace(string(data))
+		if tok == "" {
+			return "", fmt.Errorf("agent token file %q is empty", ts.file)
+		}
+		return tok, nil
+	}
+	return ts.fixed, nil
 }
 
 func getDesired(connector, localToken string) (types.DesiredState, error) {

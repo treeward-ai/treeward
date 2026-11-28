@@ -467,3 +467,61 @@ func TestSplitBootstrapSecretsCannotCrossAuthenticate(t *testing.T) {
 		t.Fatalf("POST /v1/tokens with identical enroll/admin secrets: got %d, want 401", rec.Code)
 	}
 }
+
+func TestApproveRejectsReapprovalWith409(t *testing.T) {
+	srv := newTestServer(t)
+
+	op, err := srv.Store.CreateTokenWithRole("op-1", types.RoleOperator, nil)
+	if err != nil {
+		t.Fatalf("CreateTokenWithRole op: %v", err)
+	}
+	approver1, err := srv.Store.CreateTokenWithRole("approver-1", types.RoleApprover, nil)
+	if err != nil {
+		t.Fatalf("CreateTokenWithRole approver1: %v", err)
+	}
+	approver2, err := srv.Store.CreateTokenWithRole("approver-2", types.RoleApprover, nil)
+	if err != nil {
+		t.Fatalf("CreateTokenWithRole approver2: %v", err)
+	}
+
+	art := srv.Store.CreateArtifact(types.Artifact{Name: "p-reapprove", Type: "bpf"})
+	bindRec := doReq(t, srv, http.MethodPost, "/v1/bindings", op.Token, types.Binding{ArtifactDigest: art.Digest})
+	if bindRec.Code != http.StatusCreated {
+		t.Fatalf("create binding: got %d (%s)", bindRec.Code, bindRec.Body.String())
+	}
+	var bind types.Binding
+	_ = json.Unmarshal(bindRec.Body.Bytes(), &bind)
+
+	// First approval succeeds.
+	rec1 := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", approver1.Token, types.ApproveRequest{})
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first approve: got %d (%s), want 200", rec1.Code, rec1.Body.String())
+	}
+	var firstApproved types.Binding
+	_ = json.Unmarshal(rec1.Body.Bytes(), &firstApproved)
+	if firstApproved.ApprovedBy != "approver-1" || firstApproved.ApprovedAt.IsZero() {
+		t.Fatalf("unexpected first approval metadata: %+v", firstApproved)
+	}
+
+	// Re-approving an already-approved binding must fail with 409 Conflict and preserve original approver metadata.
+	rec2 := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", approver2.Token, types.ApproveRequest{})
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("re-approve: got %d (%s), want 409", rec2.Code, rec2.Body.String())
+	}
+	got, ok := srv.Store.GetBinding(bind.ID)
+	if !ok {
+		t.Fatalf("binding disappeared")
+	}
+	if got.ApprovedBy != firstApproved.ApprovedBy || !got.ApprovedAt.Equal(firstApproved.ApprovedAt) {
+		t.Fatalf("re-approve mutated approval metadata: got (%q, %v), want (%q, %v)",
+			got.ApprovedBy, got.ApprovedAt, firstApproved.ApprovedBy, firstApproved.ApprovedAt)
+	}
+
+	// Approving after canary must also return 409 Conflict.
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/canary", op.Token, types.ApproveRequest{}); rec.Code != http.StatusOK {
+		t.Fatalf("canary: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := doReq(t, srv, http.MethodPost, "/v1/bindings/"+bind.ID+"/approve", approver2.Token, types.ApproveRequest{}); rec.Code != http.StatusConflict {
+		t.Fatalf("approve in canary: got %d (%s), want 409", rec.Code, rec.Body.String())
+	}
+}

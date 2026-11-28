@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -547,5 +548,42 @@ func TestResolveTreeVerifyConfigAndApplyECDSAP256(t *testing.T) {
 	}
 	if !reflect.DeepEqual(loaded["node-1"], []string{"sha256:p256patch"}) {
 		t.Fatalf("loaded[node-1] = %v, want [sha256:p256patch]", loaded["node-1"])
+	}
+}
+
+func TestTokenSourceRereadsRotatedTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/token"
+
+	if err := os.WriteFile(path, []byte("jwt-v1\n"), 0o600); err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	ts := tokenSource{file: path, fixed: "ignored-static"}
+	got1, err := ts.Token()
+	if err != nil || got1 != "jwt-v1" {
+		t.Fatalf("Token() v1 = (%q, %v), want (jwt-v1, nil)", got1, err)
+	}
+
+	// Simulate kubelet rotating the projected ServiceAccount token.
+	if err := os.WriteFile(path, []byte("jwt-v2\n"), 0o600); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	got2, err := ts.Token()
+	if err != nil || got2 != "jwt-v2" {
+		t.Fatalf("Token() v2 = (%q, %v), want (jwt-v2, nil)", got2, err)
+	}
+
+	// Empty file fails closed.
+	if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
+		t.Fatalf("write empty: %v", err)
+	}
+	if _, err := ts.Token(); err == nil {
+		t.Fatal("expected error for empty token file")
+	}
+
+	// Fallback to static token when file is unset.
+	tsStatic := tokenSource{fixed: "static-tok"}
+	if got, err := tsStatic.Token(); err != nil || got != "static-tok" {
+		t.Fatalf("static Token() = (%q, %v), want (static-tok, nil)", got, err)
 	}
 }

@@ -114,7 +114,8 @@ Quickstart runs with `TREEWARD_RUNTIME=stub` (no kernel enforcement). Running wi
 
 See [`SECURITY_MODEL.md`](SECURITY_MODEL.md) for the threat model, signed tree chain verification, and attestation trust boundaries.
 
-- **Split bootstrap & local tokens:** `api` requires distinct `TREEWARD_ENROLL_TOKEN` (connector enrollment) and `TREEWARD_ADMIN_BOOTSTRAP_TOKEN` (operator token minting). `connector` protects `/v1/local/*` with `TREEWARD_LOCAL_TOKEN` and fails closed if unset; set `TREEWARD_LOCAL_AUTH=off` only for local dev.
+- **Split bootstrap & local tokens:** `api` requires distinct `TREEWARD_ENROLL_TOKEN` (connector enrollment) and `TREEWARD_ADMIN_BOOTSTRAP_TOKEN` (operator token minting). `connector` protects `/v1/local/*` with `TREEWARD_LOCAL_TOKEN` (shared-token mode for non-Kubernetes VMs) or `TREEWARD_LOCAL_AUTH=k8s` (Kubernetes projected ServiceAccount tokens validated via `TokenReview` and bound to the pod's `spec.nodeName`, rejecting cross-node spoofing with `403 Forbidden`); it fails closed if neither is configured (`TREEWARD_LOCAL_AUTH=off` is permitted only on loopback addresses for local dev).
+- **Fail-closed attestation:** When `SHIRUDO_BIN` is unset on `api`, unverified attestation quotes fail closed (recorded as `pass: false, verified: false`). Set `TREEWARD_ALLOW_STUB_ATTEST=true` only for stub-agent dev/demo setups (logs a startup warning).
 - **RBAC & two-person approval:** Operator tokens support `--role <viewer|operator|approver|admin>` (default `admin` if omitted):
   ```bash
   ./bin/treeward token create alice --role operator
@@ -122,5 +123,5 @@ See [`SECURITY_MODEL.md`](SECURITY_MODEL.md) for the threat model, signed tree c
   ./bin/treeward token create audit-ro --role viewer
   ./bin/treeward token list
   ```
-  Actor identities on bindings and audit events are bound to the authenticated token. By default, the principal who created a binding cannot approve it (`403 Forbidden`); set `TREEWARD_ALLOW_SELF_APPROVE=true` on `api` only for single-operator dev/demo setups.
-- **TLS 1.3:** Set both `TREEWARD_TLS_CERT` and `TREEWARD_TLS_KEY` on `api` or `connector` to serve HTTPS with TLS 1.3 minimum.
+  Actor identities on bindings and audit events are bound to the authenticated token. By default, the principal who created a binding cannot approve it (`403 Forbidden`), and already-approved bindings cannot be re-approved (`409 Conflict`); set `TREEWARD_ALLOW_SELF_APPROVE=true` on `api` only for single-operator dev/demo setups.
+- **TLS 1.3:** Set both `TREEWARD_TLS_CERT` and `TREEWARD_TLS_KEY` on `api` or `connector` to serve HTTPS with TLS 1.3 minimum (e.g. from a mounted Kubernetes TLS Secret). Automated in-cluster TLS / custom CA provisioning for agent-to-connector traffic is tracked as a follow-up.

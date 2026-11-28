@@ -131,7 +131,8 @@ func ShirudoVerifierConfigFromEnv() ShirudoVerifierConfig {
 }
 
 // NewShirudoVerifierFromEnv constructs a ShirudoVerifier when SHIRUDO_BIN is set.
-// Returns nil when SHIRUDO_BIN is empty so callers preserve mock verification behavior.
+// Returns nil when SHIRUDO_BIN is empty; unverified results fail closed unless
+// TREEWARD_ALLOW_STUB_ATTEST=true is explicitly set.
 func NewShirudoVerifierFromEnv() *ShirudoVerifier {
 	cfg := ShirudoVerifierConfigFromEnv()
 	if cfg.Bin == "" {

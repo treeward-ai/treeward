@@ -24,12 +24,17 @@ var ErrClusterForbidden = errors.New("forbidden: cross-cluster access denied")
 // attempts to approve that same binding while two-person separation of duties is enforced.
 var ErrSelfApproveForbidden = errors.New("forbidden: binding creator cannot approve own binding")
 
+// ErrInvalidTransition is returned when a binding state transition is not
+// permitted from its current status (e.g. re-approving an already-approved binding).
+var ErrInvalidTransition = errors.New("invalid binding state transition")
+
 type Store struct {
 	mu sync.RWMutex
 
 	EnrollToken         string
 	AdminBootstrapToken string
 	AllowSelfApprove    bool
+	AllowStubAttest     bool
 	Signer              signer.Signer
 	db                  *sql.DB
 
@@ -326,8 +331,8 @@ func (s *Store) Approve(bindingID, actor string) (*types.Binding, error) {
 	if !ok {
 		return nil, fmt.Errorf("binding not found")
 	}
-	if b.Status != "draft" && b.Status != "approved" {
-		return nil, fmt.Errorf("cannot approve binding in status %s", b.Status)
+	if b.Status != "draft" && b.Status != "pending" {
+		return nil, fmt.Errorf("%w: cannot approve binding in status %s", ErrInvalidTransition, b.Status)
 	}
 	if actor == "" {
 		actor = "operator"
@@ -460,6 +465,8 @@ func (s *Store) Desired() types.DesiredState {
 }
 
 // DesiredForCluster computes per-node digests restricted to nodes belonging to clusterID.
+// Note: the signed Tree op log is global across clusters (single-tenant control plane);
+// only the computed Nodes map is filtered to clusterID.
 func (s *Store) DesiredForCluster(clusterID string) types.DesiredState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -607,9 +614,13 @@ func (s *Store) submitAttest(campaignID, clusterID string, results []types.Attes
 		var pass bool
 		if r.Verified {
 			pass = r.Pass
-		} else {
-			// Stub verify: quote must contain nonce; "FAIL" substring forces fail.
+		} else if s.AllowStubAttest {
+			// Stub verify (explicit dev/demo opt-in): quote must contain nonce; "FAIL" substring forces fail.
 			pass = strings.Contains(r.Quote, c.Nonce) && !strings.Contains(strings.ToUpper(r.Quote), "FAIL")
+		} else {
+			// Fail closed: without a cryptographic verifier or explicit stub opt-in,
+			// unverified results are recorded as failures.
+			pass = false
 		}
 		r.Pass = pass
 		r.Nonce = c.Nonce

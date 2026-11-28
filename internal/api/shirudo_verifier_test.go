@@ -373,7 +373,8 @@ func TestServer_AttestResults_ShirudoAndMockFallback(t *testing.T) {
 		return New(st), enrolled.Token, camp.ID
 	}
 
-	t.Run("SHIRUDO_BIN unset preserves mock behavior", func(t *testing.T) {
+	t.Run("SHIRUDO_BIN unset fails closed without TREEWARD_ALLOW_STUB_ATTEST", func(t *testing.T) {
+		t.Setenv("TREEWARD_ALLOW_STUB_ATTEST", "")
 		srv, tok, campID := newTestServer(t, "")
 		if srv.Verifier != nil {
 			t.Fatalf("expected Verifier=nil when SHIRUDO_BIN is unset")
@@ -395,8 +396,44 @@ func TestServer_AttestResults_ShirudoAndMockFallback(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatalf("decode response: %v", err)
 		}
-		if len(out.Results) != 1 || !out.Results[0].Pass {
-			t.Fatalf("expected mock pass, got %+v", out.Results)
+		if len(out.Results) != 1 || out.Results[0].Pass || out.Results[0].Verified {
+			t.Fatalf("expected fail-closed unverified failure, got %+v", out.Results)
+		}
+		nodes := srv.Store.ListNodes()
+		if len(nodes) != 1 || nodes[0].AttestStatus != "fail" {
+			t.Fatalf("expected node AttestStatus=fail, got %+v", nodes)
+		}
+	})
+
+	t.Run("SHIRUDO_BIN unset allows stub verify with TREEWARD_ALLOW_STUB_ATTEST=true", func(t *testing.T) {
+		t.Setenv("TREEWARD_ALLOW_STUB_ATTEST", "true")
+		srv, tok, campID := newTestServer(t, "")
+		if srv.Verifier != nil {
+			t.Fatalf("expected Verifier=nil when SHIRUDO_BIN is unset")
+		}
+		camp, _ := srv.Store.GetCampaign(campID)
+		body, _ := json.Marshal([]types.AttestResult{{
+			NodeID: "node-1",
+			Quote:  "mock-quote-" + camp.Nonce,
+		}})
+		req := httptest.NewRequest(http.MethodPost, "/v1/attest/campaigns/"+campID+"/results", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		srv.Mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		var out types.AttestCampaign
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if len(out.Results) != 1 || !out.Results[0].Pass || out.Results[0].Verified {
+			t.Fatalf("expected stub pass with Verified=false, got %+v", out.Results)
+		}
+		nodes := srv.Store.ListNodes()
+		if len(nodes) != 1 || nodes[0].AttestStatus != "pass" {
+			t.Fatalf("expected node AttestStatus=pass, got %+v", nodes)
 		}
 	})
 
