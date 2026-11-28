@@ -57,8 +57,13 @@ type Artifact struct {
 	Fixes  []string `json:"fixes,omitempty"`
 	// UpatchSHA256 / UnloadSHA256 are set for artifacts registered with bytes
 	// (POST /v1/artifacts with upatchB64). Digest is then "<name>@sha256:<UpatchSHA256>".
-	UpatchSHA256 string `json:"upatchSha256,omitempty"`
-	UnloadSHA256 string `json:"unloadSha256,omitempty"`
+	UpatchSHA256 string     `json:"upatchSha256,omitempty"`
+	UnloadSHA256 string     `json:"unloadSha256,omitempty"`
+	Archived     bool       `json:"archived,omitempty"`
+	ArchivedAt   *time.Time `json:"archivedAt,omitempty"`
+	ArchivedBy   string     `json:"archivedBy,omitempty"`
+	ValidatedAt  *time.Time `json:"validatedAt,omitempty"`
+	Lifecycle    string     `json:"lifecycle,omitempty"`
 }
 
 type Selector struct {

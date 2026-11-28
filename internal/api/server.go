@@ -63,6 +63,8 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /v1/nodes", s.withRoles(s.handleListNodes, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
 	s.Mux.HandleFunc("POST /v1/artifacts", s.withRoles(s.handleCreateArtifact, types.RoleOperator, types.RoleAdmin))
 	s.Mux.HandleFunc("GET /v1/artifacts", s.withRoles(s.handleListArtifacts, types.RoleViewer, types.RoleOperator, types.RoleApprover, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/artifacts/{id}/archive", s.withRoles(s.handleArchiveArtifact, types.RoleOperator, types.RoleAdmin))
+	s.Mux.HandleFunc("POST /v1/artifacts/{id}/restore", s.withRoles(s.handleRestoreArtifact, types.RoleOperator, types.RoleAdmin))
 	s.Mux.HandleFunc("GET /v1/upatches/{sha}", s.withConnector(s.handleGetUpatch))
 	s.Mux.HandleFunc("GET /v1/upatches/{sha}/unload", s.withConnector(s.handleGetUpatchUnload))
 	s.Mux.HandleFunc("POST /v1/bindings", s.withRoles(s.handleCreateBinding, types.RoleOperator, types.RoleAdmin))
@@ -376,6 +378,38 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Store.ListArtifacts())
 }
 
+func (s *Server) handleArchiveArtifact(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.Store.ArchiveArtifact(id, actorFromRequest(r, "")); err != nil {
+		switch {
+		case errors.Is(err, store.ErrArtifactNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, store.ErrInvalidTransition):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "action": "archive"})
+}
+
+func (s *Server) handleRestoreArtifact(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.Store.RestoreArtifact(id, actorFromRequest(r, "")); err != nil {
+		switch {
+		case errors.Is(err, store.ErrArtifactNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, store.ErrInvalidTransition):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "action": "restore"})
+}
+
 func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	var b types.Binding
 	if !decodeJSON(w, r, &b) {
@@ -385,6 +419,10 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	b.CreatedBy = ""
 	out, err := s.Store.CreateBindingBy(b, actorFromRequest(r, ""))
 	if err != nil {
+		if errors.Is(err, store.ErrArtifactArchived) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

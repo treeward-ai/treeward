@@ -28,6 +28,12 @@ var ErrSelfApproveForbidden = errors.New("forbidden: binding creator cannot appr
 // permitted from its current status (e.g. re-approving an already-approved binding).
 var ErrInvalidTransition = errors.New("invalid binding state transition")
 
+// ErrArtifactNotFound is returned when an artifact cannot be found by ID or digest.
+var ErrArtifactNotFound = errors.New("artifact not found")
+
+// ErrArtifactArchived is returned when a binding targets an archived artifact.
+var ErrArtifactArchived = errors.New("artifact archived")
+
 type Store struct {
 	mu sync.RWMutex
 
@@ -252,14 +258,92 @@ func (s *Store) CreateArtifactBy(a types.Artifact, actor string) types.Artifact 
 	return a
 }
 
+func artifactLifecycle(a *types.Artifact, latest *types.Binding) string {
+	if latest == nil {
+		return "new"
+	}
+	switch latest.Status {
+	case "draft", "pending":
+		return "pending_approval"
+	case "reverted":
+		if a.ValidatedAt != nil {
+			return "validated"
+		}
+		return "reverted"
+	default:
+		return latest.Status // approved | canary | promoted | paused
+	}
+}
+
 func (s *Store) ListArtifacts() []types.Artifact {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	latest := make(map[string]*types.Binding, len(s.Artifacts))
+	for _, b := range s.Bindings {
+		cur, ok := latest[b.ArtifactDigest]
+		if !ok || b.CreatedAt.After(cur.CreatedAt) {
+			latest[b.ArtifactDigest] = b
+		}
+	}
 	out := make([]types.Artifact, 0, len(s.Artifacts))
 	for _, a := range s.Artifacts {
-		out = append(out, *a)
+		cp := *a
+		cp.Archived = a.ArchivedAt != nil
+		cp.Lifecycle = artifactLifecycle(a, latest[a.Digest])
+		out = append(out, cp)
 	}
 	return out
+}
+
+func (s *Store) findArtifactLocked(idOrDigest string) *types.Artifact {
+	if a, ok := s.Artifacts[idOrDigest]; ok {
+		return a
+	}
+	for _, a := range s.Artifacts {
+		if a.ID == idOrDigest || a.Digest == idOrDigest {
+			return a
+		}
+	}
+	return nil
+}
+
+func (s *Store) ArchiveArtifact(idOrDigest, actor string) (*types.Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.findArtifactLocked(idOrDigest)
+	if a == nil {
+		return nil, ErrArtifactNotFound
+	}
+	if a.ArchivedAt != nil {
+		return nil, fmt.Errorf("%w: artifact already archived", ErrInvalidTransition)
+	}
+	now := time.Now().UTC()
+	a.ArchivedAt = &now
+	a.ArchivedBy = actorOr(actor)
+	s.auditLocked("artifact.archive", actorOr(actor), "", a.Digest, a.Name)
+	s.persistLocked()
+	cp := *a
+	cp.Archived = true
+	return &cp, nil
+}
+
+func (s *Store) RestoreArtifact(idOrDigest, actor string) (*types.Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.findArtifactLocked(idOrDigest)
+	if a == nil {
+		return nil, ErrArtifactNotFound
+	}
+	if a.ArchivedAt == nil {
+		return nil, fmt.Errorf("%w: artifact is not archived", ErrInvalidTransition)
+	}
+	a.ArchivedAt = nil
+	a.ArchivedBy = ""
+	s.auditLocked("artifact.restore", actorOr(actor), "", a.Digest, a.Name)
+	s.persistLocked()
+	cp := *a
+	cp.Archived = false
+	return &cp, nil
 }
 
 func (s *Store) CreateBinding(b types.Binding) (types.Binding, error) {
@@ -272,15 +356,18 @@ func (s *Store) CreateBindingBy(b types.Binding, actor string) (types.Binding, e
 	if b.ArtifactDigest == "" {
 		return types.Binding{}, fmt.Errorf("artifactDigest required")
 	}
-	found := false
+	var matched *types.Artifact
 	for _, a := range s.Artifacts {
 		if a.Digest == b.ArtifactDigest {
-			found = true
+			matched = a
 			break
 		}
 	}
-	if !found {
+	if matched == nil {
 		return types.Binding{}, fmt.Errorf("unknown artifact digest")
+	}
+	if matched.ArchivedAt != nil {
+		return types.Binding{}, ErrArtifactArchived
 	}
 	b.ID = id("bind")
 	b.Status = "draft"
@@ -405,12 +492,19 @@ func (s *Store) Revert(bindingID, actor string) (*types.Binding, error) {
 	if b.Status != "canary" && b.Status != "promoted" && b.Status != "paused" {
 		return nil, fmt.Errorf("nothing to revert (status=%s)", b.Status)
 	}
+	wasPromoted := b.Status == "promoted"
 	// Delete with empty selector = unload everywhere this digest was targeted.
 	sel := map[string]string{}
 	if err := s.appendTreeLocked(b, "delete", sel); err != nil {
 		return nil, err
 	}
 	b.Status = "reverted"
+	if wasPromoted {
+		if a := s.findArtifactLocked(b.ArtifactDigest); a != nil && a.ValidatedAt == nil {
+			now := time.Now().UTC()
+			a.ValidatedAt = &now
+		}
+	}
 	s.auditLocked("revert", actorOr(actor), b.ID, b.ArtifactDigest, "signed delete")
 	s.persistLocked()
 	cp := *b
